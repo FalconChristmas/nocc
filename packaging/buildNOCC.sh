@@ -81,9 +81,16 @@ WORK="${WORK:-$OUT/../nocc-build}"
 mkdir -p "$WORK"; WORK="$(readlink -f "$WORK")"
 
 # ---- map FPP arch -> Go target + Debian triplet -----------------------------
+# armhf: the Go binaries build for ARMv6 (GOARM=6, VFPv2) so they run on the Pi
+# Zero/1 (ARM1176) as well as ARMv7 boards (BBB, Pi 2). The C++ wrapper, though,
+# needs a genuine ARMv6 *toolchain* -- its CRT/libgcc come from the toolchain,
+# and Debian's armhf toolchain is ARMv7 -- so the SHIPPED wrapper is built with
+# dockcross/linux-armv6 in CI (see the fork's build-deb.yml). Run standalone
+# (no dockcross), buildNOCC.sh emits an ARMv7 wrapper: fine for BBB dev, NOT for
+# Pi Zero.
 GOARCH=""; GOARM=""; TRIPLET=""
 case "$ARCH" in
-    armhf) GOARCH="arm";   GOARM="7"; TRIPLET="arm-linux-gnueabihf" ;;
+    armhf) GOARCH="arm";   GOARM="6"; TRIPLET="arm-linux-gnueabihf" ;;
     arm64) GOARCH="arm64";            TRIPLET="aarch64-linux-gnu" ;;
     amd64) GOARCH="amd64";            TRIPLET="x86_64-linux-gnu" ;;
     *) echo "buildNOCC: unsupported --arch '$ARCH' (armhf|arm64|amd64)" >&2; exit 2 ;;

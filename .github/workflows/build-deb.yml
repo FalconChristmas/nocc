@@ -25,13 +25,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++-arm-linux-gnueabihf g++-aarch64-linux-gnu dpkg-dev
 
-      - name: Build debs (armhf, arm64, amd64)
+      - name: Build debs (arm64, amd64)
         run: |
           chmod +x packaging/*.sh
-          for a in armhf arm64 amd64; do
-            packaging/buildNOCC-deb.sh --arch "$a" --src "$PWD" \
-              --out "$PWD/out" --work "$PWD/work"
+          for a in arm64 amd64; do
+            packaging/buildNOCC-deb.sh --arch "$a" --src "$PWD" --out "$PWD/out" --work "$PWD/work"
           done
+
+      - name: Build armhf deb (ARMv6 wrapper via dockcross, for Pi Zero/1)
+        run: |
+          # The Go binaries are ARMv6 (GOARM=6), but the C++ wrapper needs a real
+          # ARMv6 toolchain -- Debian's armhf toolchain is ARMv7 and would fault
+          # on a Pi Zero/1. So build Go + a throwaway wrapper, rebuild the wrapper
+          # with dockcross/linux-armv6, verify it is v6, then package that.
+          packaging/buildNOCC.sh --arch armhf --src "$PWD" --out "$PWD/bin-armhf" --work "$PWD/work"
+          docker run --rm dockcross/linux-armv6 > ./dcross && chmod +x ./dcross
+          ./dcross bash -c '$CXX -std=c++11 -O3 -o bin-armhf/nocc cmd/nocc.cpp'
+          echo "armhf wrapper: $(readelf -A bin-armhf/nocc | grep -oE 'Tag_CPU_arch: v[0-9A-Za-z]+')"
+          readelf -A bin-armhf/nocc | grep -q 'Tag_CPU_arch: v6' \
+            || { echo 'ERROR: armhf wrapper is not ARMv6 -- would fault on Pi Zero/1'; exit 1; }
+          packaging/buildNOCC-deb.sh --arch armhf --src "$PWD" --bin-dir "$PWD/bin-armhf" --out "$PWD/out"
           ls -l out/*.deb
 
       - name: Checkout fpp-apt (pool target)

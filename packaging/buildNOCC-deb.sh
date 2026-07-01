@@ -26,7 +26,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
-ARCH=""; OUT=""; WORK=""; VERSION=""; SRC_DIR=""
+ARCH=""; OUT=""; WORK=""; VERSION=""; SRC_DIR=""; BIN_DIR=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --arch)    ARCH="$2"; shift 2 ;;
@@ -34,6 +34,7 @@ while [ $# -gt 0 ]; do
         --work)    WORK="$2"; shift 2 ;;
         --version) VERSION="$2"; shift 2 ;;
         --src)     SRC_DIR="$2"; shift 2 ;;   # build an existing checkout (the nocc fork's CI)
+        --bin-dir) BIN_DIR="$2"; shift 2 ;;   # package pre-built nocc/-daemon/-server (skip build)
         -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
         *) echo "buildNOCC-deb: unknown option: $1" >&2; exit 2 ;;
     esac
@@ -48,9 +49,19 @@ mkdir -p "$WORK"; WORK="$(readlink -f "$WORK")"
 command -v dpkg-deb >/dev/null 2>&1 || { echo "buildNOCC-deb: dpkg-deb not found (apt-get install dpkg-dev)" >&2; exit 1; }
 
 # ---- 1. compile the binaries (pinned source + pinned Go, all in buildNOCC) ---
-BIN="$WORK/bin-$ARCH"
-rm -rf "$BIN"; mkdir -p "$BIN"
-"$HERE/buildNOCC.sh" --arch "$ARCH" --out "$BIN" --work "$WORK" ${SRC_DIR:+--src "$SRC_DIR"}
+if [ -n "$BIN_DIR" ]; then
+    # Package pre-built binaries (e.g. the armhf wrapper built with an ARMv6
+    # toolchain in CI) instead of compiling here.
+    BIN="$(readlink -f "$BIN_DIR")"
+    for b in nocc nocc-daemon nocc-server; do
+        [ -f "$BIN/$b" ] || { echo "buildNOCC-deb: --bin-dir missing $b" >&2; exit 1; }
+    done
+    echo "==> Packaging pre-built binaries from $BIN"
+else
+    BIN="$WORK/bin-$ARCH"
+    rm -rf "$BIN"; mkdir -p "$BIN"
+    "$HERE/buildNOCC.sh" --arch "$ARCH" --out "$BIN" --work "$WORK" ${SRC_DIR:+--src "$SRC_DIR"}
+fi
 
 # ---- 2. derive a Debian version from `git describe` -------------------------
 # e.g. "v1.2-6-g0bed389" -> "1.2+6.g0bed389-1". The commit COUNT (6) is
