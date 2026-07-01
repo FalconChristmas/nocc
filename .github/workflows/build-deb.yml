@@ -1,0 +1,58 @@
+# FalconChristmas/nocc — build nocc .debs and publish into fpp-apt's pool.
+#
+# This fork IS the pinned, org-controlled nocc source. packaging/buildNOCC*.sh
+# (copied from FalconChristmas/fpp) build it; no cross-repo checkout of fpp.
+#
+# Requires repo secret FPP_APT_TOKEN: a token with contents:write on fpp-apt.
+name: build-deb
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout nocc (this fork = the source)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags so buildNOCC-deb.sh's `git describe` works
+
+      - name: Install cross toolchains + dpkg-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-arm-linux-gnueabihf g++-aarch64-linux-gnu dpkg-dev
+
+      - name: Build debs (armhf, arm64, amd64)
+        run: |
+          chmod +x packaging/*.sh
+          for a in armhf arm64 amd64; do
+            packaging/buildNOCC-deb.sh --arch "$a" --src "$PWD" \
+              --out "$PWD/out" --work "$PWD/work"
+          done
+          ls -l out/*.deb
+
+      - name: Checkout fpp-apt (pool target)
+        uses: actions/checkout@v4
+        with:
+          repository: FalconChristmas/fpp-apt
+          path: fpp-apt
+          token: ${{ secrets.FPP_APT_TOKEN }}
+
+      - name: Add debs to pool and push
+        run: |
+          MSG=$(ls out/nocc_*_amd64.deb 2>/dev/null | xargs -n1 basename | head -1)
+          mkdir -p fpp-apt/pool/main/n/nocc
+          cp out/nocc_*_*.deb fpp-apt/pool/main/n/nocc/
+          cd fpp-apt
+          git config user.name  "fpp-bot"
+          git config user.email "fpp-bot@users.noreply.github.com"
+          git add pool
+          if git diff --cached --quiet; then
+            echo "No pool changes."
+          else
+            git commit -m "nocc: ${MSG:-update}"
+            git push
+          fi
