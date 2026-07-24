@@ -11,6 +11,7 @@ import (
 	"github.com/VKCOM/nocc/internal/server"
 	"github.com/VKCOM/nocc/pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 func failedStart(message string, err error) {
@@ -132,7 +133,19 @@ func main() {
 		failedStart("Failed to init pch compilation", err)
 	}
 
-	s.GRPCServer = grpc.NewServer()
+	// Match the client's keepalive (see grpc-client.go). EnforcementPolicy must permit
+	// the client's ping cadence, otherwise the server answers idle-connection pings with
+	// GOAWAY "too_many_pings" and resets the stream — the exact failure we're fixing.
+	s.GRPCServer = grpc.NewServer(
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second, // tolerate client pings as often as every 10s
+			PermitWithoutStream: true,             // ...even with no active RPC
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    20 * time.Second, // also ping idle clients from the server side
+			Timeout: 10 * time.Second,
+		}),
+	)
 	pb.RegisterCompilationServiceServer(s.GRPCServer, s)
 
 	s.Cron, err = server.MakeCron(s)
