@@ -60,7 +60,10 @@ func (deps *DepCmdFlags) SetCmdFlagMP() {
 
 // ShouldGenerateDepFile determines whether to output .o.d file besides .o compilation
 func (deps *DepCmdFlags) ShouldGenerateDepFile() bool {
-	return deps.flagMD || deps.flagMF != ""
+	// -MMD is "-MD, but omit system headers" — it emits a depfile just like -MD does, it is not a
+	// mere modifier. It is stripped off cxxArgs like the rest of them, so if it does not generate
+	// the depfile here, nothing does, and the build silently loses all header dependency tracking.
+	return deps.flagMD || deps.flagMMD || deps.flagMF != ""
 }
 
 // GenerateAndSaveDepFile is called if a .o.d file generation is needed.
