@@ -336,5 +336,11 @@ func (daemon *Daemon) areAllRemotesAvailable() bool {
 func (daemon *Daemon) chooseRemoteConnectionForCppCompilation(cppInFile string) *RemoteConnection {
 	hasher := fnv.New32a()
 	_, _ = hasher.Write([]byte(filepath.Base(cppInFile)))
-	return daemon.remoteConnections[int(hasher.Sum32())%len(daemon.remoteConnections)]
+	// Reduce in uint32, not int. On a 32-bit client (armv7 -- BeagleBone, Pi Zero/1)
+	// int is 32 bits, so int(hasher.Sum32()) is negative for every hash with the top
+	// bit set, i.e. about half of all file names. A negative dividend keeps its sign
+	// through Go's % operator, so the index became -1 with two servers configured and
+	// panicked the daemon on the first such file. With a single server it happened to
+	// be masked, since x%1 == 0 for any x.
+	return daemon.remoteConnections[hasher.Sum32()%uint32(len(daemon.remoteConnections))]
 }

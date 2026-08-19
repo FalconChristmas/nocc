@@ -20,6 +20,17 @@ jobs:
         with:
           fetch-depth: 0   # full history + tags so buildNOCC-deb.sh's `git describe` works
 
+      - name: Unit tests (64-bit and 32-bit)
+        run: |
+          # Run the tests under a 32-bit GOARCH as well, not just the runner's
+          # amd64. FPP's clients include armv7 boards (BeagleBone, Pi Zero/1)
+          # where int is 32 bits, and at least one bug -- a hash reduced modulo
+          # the server count in signed int, which went negative and panicked the
+          # daemon -- could not reproduce on a 64-bit host at all. Pure-Go test
+          # binaries need no 32-bit runtime libraries to execute here.
+          go test ./internal/...
+          GOARCH=386 go test ./internal/...
+
       - name: Install cross toolchains + dpkg-dev
         run: |
           sudo apt-get update
