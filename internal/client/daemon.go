@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/VKCOM/nocc/internal/common"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Daemon is created once, in a separate process `nocc-daemon`, which is listening for connections via unix socket.
@@ -45,7 +47,8 @@ type Daemon struct {
 	activeInvocations map[uint32]*Invocation
 	mu                sync.RWMutex
 
-	includesCache map[string]*IncludesCache // map[cxx_name] => cache (support various cxx compilers during a daemon lifetime)
+	includesCache     map[string]*IncludesCache // map[cxx_name] => cache (support various cxx compilers during a daemon lifetime)
+	cxxTargetTriplets map[string]string         // map[cxx_name] => `cxx -dumpmachine`, see GetCxxTargetTriplet
 
 	forceInterruptTimeout time.Duration
 }
@@ -104,6 +107,7 @@ func MakeDaemon(remoteNoccHosts []string, disableObjCache bool, disableOwnInclud
 		disableLocalCxx:       maxLocalCxxProcesses == 0,
 		activeInvocations:     make(map[uint32]*Invocation, 300),
 		includesCache:         make(map[string]*IncludesCache, 1),
+		cxxTargetTriplets:     make(map[string]string, 1),
 		forceInterruptTimeout: forceInterruptTimeout,
 	}
 
@@ -231,12 +235,11 @@ func (daemon *Daemon) HandleInvocation(req DaemonSockRequest) DaemonSockResponse
 			return daemon.FallbackToLocalCxx(req, fmt.Errorf("no remote hosts set; use NOCC_SERVERS env var or NOCC_DISCOVER_MDNS to provide servers"))
 		}
 
-		remote := daemon.chooseRemoteConnectionForCppCompilation(invocation.cppInFile)
-		invocation.summary.remoteHost = remote.remoteHost
-
-		if remote.isUnavailable {
-			return daemon.FallbackToLocalCxx(req, fmt.Errorf("remote %s is unavailable", remote.remoteHost))
+		remote := daemon.chooseRemoteConnectionForCppCompilation(invocation.cppInFile, invocation.cxxName)
+		if remote == nil {
+			return daemon.FallbackToLocalCxx(req, fmt.Errorf("no remote can compile %s with %s", invocation.cppInFile, invocation.cxxName))
 		}
+		invocation.summary.remoteHost = remote.remoteHost
 
 		daemon.mu.Lock()
 		daemon.activeInvocations[invocation.sessionID] = invocation
@@ -251,6 +254,11 @@ func (daemon *Daemon) HandleInvocation(req DaemonSockRequest) DaemonSockResponse
 		daemon.mu.Unlock()
 
 		if err != nil { // it's not an error in C++ code, it's a network error or remote failure
+			// a remote that refused to be this compiler stays refused: the next file hashing here
+			// goes elsewhere, so a mismatched server costs one local compilation, not one per file
+			if status.Code(err) == codes.FailedPrecondition {
+				remote.MarkIncapableOfCxx(invocation.cxxName, status.Convert(err).Message())
+			}
 			return daemon.FallbackToLocalCxx(req, err)
 		}
 
@@ -339,7 +347,18 @@ func (daemon *Daemon) areAllRemotesAvailable() bool {
 	return true
 }
 
-func (daemon *Daemon) chooseRemoteConnectionForCppCompilation(cppInFile string) *RemoteConnection {
+// chooseRemoteConnectionForCppCompilation picks the server a .cpp is compiled on.
+// The choice is a hash of the file's basename, so the same file goes to the same server from
+// every machine and finds its dependencies already uploaded there.
+//
+// If that server can't take the file — it's down, or it isn't the compiler we asked for — we walk
+// forward to the next one that can, instead of compiling locally. Only the files that hashed to the
+// unusable server move, and they move deterministically, so the rest of the mapping (and every other
+// server's cache) is untouched. Compiling locally is the last resort: on the slow, often single-core
+// machines nocc exists for, "1/N of the build runs here" is the outcome worth avoiding.
+//
+// Returns nil if no server can serve this compilation at all.
+func (daemon *Daemon) chooseRemoteConnectionForCppCompilation(cppInFile string, cxxName string) *RemoteConnection {
 	hasher := fnv.New32a()
 	_, _ = hasher.Write([]byte(filepath.Base(cppInFile)))
 	// Reduce in uint32, not int. On a 32-bit client (armv7 -- BeagleBone, Pi Zero/1)
@@ -348,5 +367,14 @@ func (daemon *Daemon) chooseRemoteConnectionForCppCompilation(cppInFile string) 
 	// through Go's % operator, so the index became -1 with two servers configured and
 	// panicked the daemon on the first such file. With a single server it happened to
 	// be masked, since x%1 == 0 for any x.
-	return daemon.remoteConnections[hasher.Sum32()%uint32(len(daemon.remoteConnections))]
+	nRemotes := uint32(len(daemon.remoteConnections))
+	startIndex := hasher.Sum32() % nRemotes
+
+	for offset := uint32(0); offset < nRemotes; offset++ {
+		remote := daemon.remoteConnections[(startIndex+offset)%nRemotes]
+		if remote.CanCompileWithCxx(cxxName) {
+			return remote
+		}
+	}
+	return nil
 }

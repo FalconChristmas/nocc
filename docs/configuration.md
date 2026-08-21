@@ -59,6 +59,9 @@ A few properties worth knowing:
   correctness) on the next build. A fixed `NOCC_SERVERS` is still the better choice for a CI fleet.
 * Discovery never fails a build. If nothing answers, the daemon runs with whatever was configured statically —
   possibly nothing, in which case compilation happens locally.
+* A discovered server that doesn't have your compiler — or has that name pointing at a compiler for another
+  architecture — refuses the session and is then skipped, so it can't quietly serve you wrong objects.
+  See [checking that a server is the right compiler](./architecture.md#checking-that-a-server-is-the-right-compiler).
 
 
 <p><br></p>

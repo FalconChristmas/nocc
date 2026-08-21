@@ -18,6 +18,10 @@ func newTestDaemon(cxxName string) *Daemon {
 				hFilesInfo:      make(map[string]*includeCachedHFile),
 			},
 		},
+		cxxTargetTriplets: map[string]string{
+			// pre-seeded, so parsing a command line in a test never execs the real compiler
+			cxxName: "x86_64-test-linux-gnu",
+		},
 	}
 }
 

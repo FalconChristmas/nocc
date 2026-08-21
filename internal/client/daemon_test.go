@@ -34,7 +34,7 @@ func TestChooseRemoteConnectionForCppCompilationStaysInRange(t *testing.T) {
 		seen := make(map[string]bool, numRemotes)
 		for i := 0; i < 20000; i++ {
 			cppInFile := fmt.Sprintf("src/file%d.cpp", i)
-			remote := daemon.chooseRemoteConnectionForCppCompilation(cppInFile)
+			remote := daemon.chooseRemoteConnectionForCppCompilation(cppInFile, "g++")
 			if remote == nil {
 				t.Fatalf("numRemotes=%d %s: got nil remote", numRemotes, cppInFile)
 			}
