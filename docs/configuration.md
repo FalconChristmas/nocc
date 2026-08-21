@@ -42,7 +42,15 @@ NOCC_DISCOVER_MDNS=1 NOCC_GO_EXECUTABLE=/path/to/nocc-daemon make -j 8
 ```
 
 `nocc -check-servers -discover-mdns` prints what was found, which is the quickest way to tell whether
-multicast reaches between two machines.
+multicast reaches between two machines. For scripts that need to build a server list themselves,
+`nocc -print-discovered-servers` writes one `host:port` per line and nothing else:
+
+```bash
+NOCC_SERVERS=$(nocc -print-discovered-servers | paste -sd';' -)
+```
+
+Prefer it over browsing with an external mDNS tool: a helper with more than one interface announces more
+than one address, and this resolves each helper to a single address that is routable from here.
 
 Both sides are off by default, and deliberately so: compilation ships your source code to whoever answers,
 so joining a build cluster should be a decision, not a side effect of being on the same Wi-Fi.

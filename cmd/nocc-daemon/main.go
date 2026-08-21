@@ -52,15 +52,15 @@ func parseNoccServersEnv(envNoccServers string) (remoteNoccHosts []string) {
 	return
 }
 
-// discoverNoccServersOverMdns appends servers announcing themselves on the LAN to the static list.
-// Discovery never replaces NOCC_SERVERS and never fails a build: if the network says nothing
-// (or says something broken), we continue with whatever was configured statically — possibly
-// nothing, which the callers below already handle.
-func discoverNoccServersOverMdns(staticHosts []string, timeout time.Duration, cacheTTL time.Duration, printFound bool) []string {
+// browseNoccServers looks for servers announcing themselves on the LAN.
+// Discovery never fails a build: if the network says nothing (or says something broken),
+// the caller continues with whatever was configured statically — possibly nothing, which
+// the callers below already handle.
+func browseNoccServers(timeout time.Duration, cacheTTL time.Duration, printFound bool) []discovery.ServerInfo {
 	found, err := discovery.BrowseCached(timeout, cacheTTL, discovery.DefaultCachePath())
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "[nocc] mdns discovery failed:", err)
-		return staticHosts
+		return nil
 	}
 
 	if printFound {
@@ -68,7 +68,7 @@ func discoverNoccServersOverMdns(staticHosts []string, timeout time.Duration, ca
 			_, _ = fmt.Fprintln(os.Stderr, "[nocc] discovered", info)
 		}
 	}
-	return discovery.MergeWithStaticHosts(staticHosts, found)
+	return found
 }
 
 func main() {
@@ -86,6 +86,8 @@ func main() {
 		"", "NOCC_SERVERS")
 	discoverMdns := common.CmdEnvBool("Discover nocc servers on the local network over mDNS/DNS-SD ('_nocc._tcp'),\nin addition to NOCC_SERVERS. Servers must be launched with -advertise-mdns.", false,
 		"discover-mdns", "NOCC_DISCOVER_MDNS")
+	printDiscoveredServers := common.CmdEnvBool("Discover nocc servers over mDNS, print them as 'host:port' lines and exit.\nFor scripts that build a server list (the daemon's own discovery is NOCC_DISCOVER_MDNS).", false,
+		"print-discovered-servers", "")
 	discoverTimeout := common.CmdEnvDuration("How long to wait for mDNS answers when discovering servers. By default, it's 500ms.", 500*time.Millisecond,
 		"", "NOCC_DISCOVER_TIMEOUT")
 	discoverCacheTTL := common.CmdEnvDuration("How long a discovery result is reused before browsing the network again, 0 to disable.\nBy default, it's 1 minute.", time.Minute,
@@ -114,9 +116,21 @@ func main() {
 		remoteNoccHosts = readNoccServersFile(*noccServersFilename)
 	}
 
-	if *discoverMdns {
+	if *discoverMdns || *printDiscoveredServers {
+		cacheTTL := *discoverCacheTTL
+		if *printDiscoveredServers {
+			cacheTTL = 0 // a script asking what's on the network right now wants a live answer, not a cached one
+		}
 		// `-check-servers` is the command people run to find out what discovery sees, so let it be verbose
-		remoteNoccHosts = discoverNoccServersOverMdns(remoteNoccHosts, *discoverTimeout, *discoverCacheTTL, *checkServersAndExit)
+		found := browseNoccServers(*discoverTimeout, cacheTTL, *checkServersAndExit)
+
+		if *printDiscoveredServers {
+			for _, info := range found {
+				fmt.Println(info.HostPort)
+			}
+			os.Exit(0)
+		}
+		remoteNoccHosts = discovery.MergeWithStaticHosts(remoteNoccHosts, found)
 	}
 
 	if *showVersionAndExit || *showVersionAndExitShort {
