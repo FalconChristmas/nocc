@@ -5,6 +5,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/VKCOM/nocc/pb"
+	"google.golang.org/grpc"
 )
 
 func newTestDaemonWithRemote() (*Daemon, *RemoteConnection) {
@@ -89,5 +92,33 @@ func TestRemoteRetryDelay(t *testing.T) {
 		if got := remoteRetryDelay(attempt); got != delay {
 			t.Errorf("attempt %d: got %v, want %v", attempt, got, delay)
 		}
+	}
+}
+
+type fakeRecvStream struct {
+	grpc.ClientStream
+	replies chan *pb.RecvCompiledObjChunkReply
+}
+
+func (f *fakeRecvStream) Recv() (*pb.RecvCompiledObjChunkReply, error) {
+	return <-f.replies, nil
+}
+
+// A server that predates its own check may still report a killed compiler as exit code -1;
+// the client must take that as a remote failure (and retry), not as a compile error to show.
+func TestKilledRemoteCompilerIsARemoteFailure(t *testing.T) {
+	daemon, _ := newTestDaemonWithRemote()
+	daemon.quitChan = make(chan int)
+	invocation := &Invocation{sessionID: 5, summary: MakeInvocationSummary()}
+	invocation.wgRecv.Add(1)
+	daemon.activeInvocations[invocation.sessionID] = invocation
+
+	stream := &fakeRecvStream{replies: make(chan *pb.RecvCompiledObjChunkReply, 1)}
+	stream.replies <- &pb.RecvCompiledObjChunkReply{SessionID: 5, CxxExitCode: -1, CxxStderr: []byte("signal: terminated")}
+	go (&FilesReceiving{daemon: daemon}).monitorRemoteStreamForObjReceiving(stream, func() {})
+
+	invocation.wgRecv.Wait()
+	if invocation.err == nil {
+		t.Fatalf("exit code %d was taken as a compile result, so it would never be retried", invocation.cxxExitCode)
 	}
 }
