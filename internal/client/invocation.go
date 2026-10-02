@@ -23,8 +23,9 @@ type Invocation struct {
 	invokeType int   // one of the constants above
 	err        error // any error occurred while parsing/uploading/compiling/receiving
 
-	createTime time.Time // used for local timeout
-	sessionID  uint32    // incremental while a daemon is alive
+	createTime time.Time         // used for local timeout
+	sessionID  uint32            // incremental while a daemon is alive
+	remote     *RemoteConnection // where it's being compiled, so a remote going down interrupts it
 
 	// cwd of the `nocc` client that issued this invocation. Every relative path on the cmd line is
 	// relative to THIS, never to the daemon's own process cwd: the daemon is long-lived and serves
@@ -270,8 +271,18 @@ func (invocation *Invocation) DoneUploadFile(err error) {
 	if err != nil {
 		invocation.err = err
 	}
-	atomic.AddInt32(&invocation.waitUploads, -1)
-	invocation.wgUpload.Done() // will end up after all required files uploaded/failed
+	// an upload can complete concurrently with ForceInterrupt draining the counter;
+	// never let the two together release wgUpload more times than it was added
+	for {
+		waitUploads := atomic.LoadInt32(&invocation.waitUploads)
+		if waitUploads <= 0 {
+			return
+		}
+		if atomic.CompareAndSwapInt32(&invocation.waitUploads, waitUploads, waitUploads-1) {
+			invocation.wgUpload.Done() // will end up after all required files uploaded/failed
+			return
+		}
+	}
 }
 
 func (invocation *Invocation) ForceInterrupt(err error) {

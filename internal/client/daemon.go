@@ -35,13 +35,17 @@ type Daemon struct {
 	hostUserName string
 
 	listener          *DaemonUnixSockListener
-	remoteConnections []*RemoteConnection
+	remoteConnections []*RemoteConnection // replaced as a whole (copy-on-write) on reconnect; read via getRemotes
+	remotesMu         sync.RWMutex
+	reconnectMu       sync.Mutex // one reconnect round at a time, see reconnectUnavailableRemotes
 	allRemotesDelim   string
 	localCxxThrottle  chan struct{}
 
-	disableObjCache    bool
-	disableOwnIncludes bool
-	disableLocalCxx    bool
+	disableObjCache      bool
+	disableOwnIncludes   bool
+	disableLocalCxx      bool
+	disableLocalFallback bool // a .cpp that can't be compiled remotely fails instead of being compiled here
+	remoteRetries        int  // how many more times a failed remote compilation is tried before giving up
 
 	totalInvocations  uint32
 	activeInvocations map[uint32]*Invocation
@@ -80,7 +84,7 @@ func detectHostUserName() string {
 	return curUser.Username
 }
 
-func MakeDaemon(remoteNoccHosts []string, disableObjCache bool, disableOwnIncludes bool, maxLocalCxxProcesses int64, forceInterruptTimeout time.Duration) (*Daemon, error) {
+func MakeDaemon(remoteNoccHosts []string, disableObjCache bool, disableOwnIncludes bool, maxLocalCxxProcesses int64, forceInterruptTimeout time.Duration, remoteRetries int64, disableLocalFallback bool) (*Daemon, error) {
 	// send env NOCC_SERVERS on connect everywhere
 	// this is for debugging purpose: in production, all clients should have the same servers list
 	// to ensure this, just grep server logs: only one unique string should appear
@@ -105,6 +109,8 @@ func MakeDaemon(remoteNoccHosts []string, disableObjCache bool, disableOwnInclud
 		disableOwnIncludes:    disableOwnIncludes,
 		disableObjCache:       disableObjCache,
 		disableLocalCxx:       maxLocalCxxProcesses == 0,
+		disableLocalFallback:  disableLocalFallback,
+		remoteRetries:         int(remoteRetries),
 		activeInvocations:     make(map[uint32]*Invocation, 300),
 		includesCache:         make(map[string]*IncludesCache, 1),
 		cxxTargetTriplets:     make(map[string]string, 1),
@@ -122,7 +128,7 @@ func MakeDaemon(remoteNoccHosts []string, disableObjCache bool, disableOwnInclud
 		go func(index int, remoteHostPort string) {
 			remote, err := MakeRemoteConnection(daemon, remoteHostPort, ctxConnect)
 			if err != nil {
-				remote.isUnavailable = true
+				remote.isUnavailable.Store(true)
 				logClient.Error("error connecting to", remoteHostPort, err)
 			}
 
@@ -146,11 +152,11 @@ func (daemon *Daemon) ServeUntilNobodyAlive() {
 	var rLimit syscall.Rlimit
 	_ = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 	remoteHostPorts := make([]string, 0, len(daemon.remoteConnections))
-	for _, remote := range daemon.remoteConnections {
+	for _, remote := range daemon.getRemotes() {
 		remoteHostPorts = append(remoteHostPorts, remote.remoteHostPort)
 	}
 	// log the servers, not just their count: with mdns discovery on, the list isn't in any config file
-	logClient.Info(0, "env:", "clientID", daemon.clientID, "; user", daemon.hostUserName, "; servers", strings.Join(remoteHostPorts, ","), "; num servers", len(daemon.remoteConnections), "; ulimit -n", rLimit.Cur, "; num cpu", runtime.NumCPU(), "; version", common.GetVersion())
+	logClient.Info(0, "env:", "clientID", daemon.clientID, "; user", daemon.hostUserName, "; servers", strings.Join(remoteHostPorts, ","), "; num servers", len(remoteHostPorts), "; retries", daemon.remoteRetries, "; local fallback", !daemon.disableLocalFallback, "; ulimit -n", rLimit.Cur, "; num cpu", runtime.NumCPU(), "; version", common.GetVersion())
 
 	go daemon.PeriodicallyInterruptHangedInvocations()
 	go daemon.listener.StartAcceptingConnections(daemon)
@@ -165,7 +171,7 @@ func (daemon *Daemon) QuitDaemonGracefully(reason string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	for _, remote := range daemon.remoteConnections {
+	for _, remote := range daemon.getRemotes() {
 		remote.SendStopClient(ctx)
 		remote.Clear()
 	}
@@ -177,11 +183,27 @@ func (daemon *Daemon) QuitDaemonGracefully(reason string) {
 	daemon.mu.Unlock()
 }
 
-func (daemon *Daemon) OnRemoteBecameUnavailable(remoteHostPost string, reason error) {
-	for _, remote := range daemon.remoteConnections {
-		if remote.remoteHostPort == remoteHostPost && !remote.isUnavailable {
-			remote.isUnavailable = true
-			logClient.Error("remote", remoteHostPost, "became unavailable:", reason)
+// OnRemoteBecameUnavailable is called by a stream of grpcClient that broke and couldn't be reopened.
+// The connection is matched by identity, not by host: a stream of a connection already replaced
+// by a reconnect must not take down its successor to the same host.
+func (daemon *Daemon) OnRemoteBecameUnavailable(grpcClient *GRPCClient, reason error) {
+	for _, remote := range daemon.getRemotes() {
+		if remote.grpcClient == grpcClient && remote.isUnavailable.CompareAndSwap(false, true) {
+			logClient.Error("remote", remote.remoteHostPort, "became unavailable:", reason)
+			daemon.interruptInvocationsOnRemote(remote, fmt.Errorf("remote %s became unavailable: %v", remote.remoteHost, reason))
+		}
+	}
+}
+
+// interruptInvocationsOnRemote fails compilations in flight on a remote that went down.
+// Their uploads or .o files will never arrive, and waiting for forceInterruptTimeout
+// before retrying elsewhere (or falling back) would stall the build for minutes.
+func (daemon *Daemon) interruptInvocationsOnRemote(remote *RemoteConnection, reason error) {
+	daemon.mu.RLock()
+	defer daemon.mu.RUnlock()
+	for _, invocation := range daemon.activeInvocations {
+		if invocation.remote == remote {
+			invocation.ForceInterrupt(reason)
 		}
 	}
 }
@@ -220,7 +242,7 @@ func (daemon *Daemon) HandleInvocation(req DaemonSockRequest) DaemonSockResponse
 		invocation.includesCache.AddHFileInfo(ownPch.OwnPchFile, fileSize, ownPch.PchHash, []string{})
 		logClient.Info(0, "saved pch file", fileSize, "bytes to", ownPch.OwnPchFile)
 
-		if !daemon.areAllRemotesAvailable() {
+		if !daemon.areAllRemotesAvailable() && !daemon.disableLocalFallback {
 			logClient.Info(0, "compiling real pch file for future local compilations", invocation.GetObjOutFileAbs())
 			return daemon.FallbackToLocalCxx(req, nil)
 		}
@@ -231,39 +253,92 @@ func (daemon *Daemon) HandleInvocation(req DaemonSockRequest) DaemonSockResponse
 		}
 
 	case invokedForCompilingCpp:
-		if len(daemon.remoteConnections) == 0 {
-			return daemon.FallbackToLocalCxx(req, fmt.Errorf("no remote hosts set; use NOCC_SERVERS env var or NOCC_DISCOVER_MDNS to provide servers"))
+		return daemon.compileCppRemotelyWithRetries(req, invocation)
+	}
+}
+
+// compileCppRemotelyWithRetries compiles a .cpp on the pool of servers, retrying up to remoteRetries times
+// after a network or server failure. Every retry gives servers marked unavailable another chance first
+// (a restarted server is usable again), then picks a server the usual way.
+// Only after all retries fail does it fall back to local compilation, or fail when that's disabled.
+func (daemon *Daemon) compileCppRemotelyWithRetries(req DaemonSockRequest, invocation *Invocation) DaemonSockResponse {
+	if len(daemon.getRemotes()) == 0 {
+		return daemon.onRemoteCompilationFailed(req, invocation, fmt.Errorf("no remote hosts set; use NOCC_SERVERS env var or NOCC_DISCOVER_MDNS to provide servers"))
+	}
+
+	for attempt := 0; ; attempt++ {
+		reply, err := daemon.tryCompileCppRemotely(req, invocation)
+		if err == nil {
+			return reply
+		}
+		if attempt >= daemon.remoteRetries {
+			return daemon.onRemoteCompilationFailed(req, invocation, err)
 		}
 
-		remote := daemon.chooseRemoteConnectionForCppCompilation(invocation.cppInFile, invocation.cxxName)
-		if remote == nil {
-			return daemon.FallbackToLocalCxx(req, fmt.Errorf("no remote can compile %s with %s", invocation.cppInFile, invocation.cxxName))
+		delay := remoteRetryDelay(attempt)
+		logClient.Error("remote compilation failed, retry", attempt+1, "of", daemon.remoteRetries, "in", delay, invocation.cppInFile+":", err)
+		time.Sleep(delay)
+		daemon.reconnectUnavailableRemotes()
+
+		// a fresh sessionID: the failed session may still be alive on a server, and must not be confused with this one
+		invocation = ParseCmdLineInvocation(daemon, req.Cwd, req.CmdLine)
+	}
+}
+
+// remoteRetryDelay is 1s, 2s, 4s, 8s, then 10s for every next retry — long enough in total for a server
+// to come back from a restart, short enough not to stall a build that only hit a blip.
+func remoteRetryDelay(attempt int) time.Duration {
+	if attempt >= 4 {
+		return 10 * time.Second
+	}
+	return time.Second << attempt
+}
+
+// tryCompileCppRemotely is one attempt to compile a .cpp on some server.
+// A non-nil error means a network or server failure, not an error in C++ code (that's a non-zero ExitCode).
+func (daemon *Daemon) tryCompileCppRemotely(req DaemonSockRequest, invocation *Invocation) (DaemonSockResponse, error) {
+	remote := daemon.chooseRemoteConnectionForCppCompilation(invocation.cppInFile, invocation.cxxName)
+	if remote == nil {
+		return DaemonSockResponse{}, fmt.Errorf("no remote can compile %s with %s", invocation.cppInFile, invocation.cxxName)
+	}
+	invocation.remote = remote
+	invocation.summary.remoteHost = remote.remoteHost
+
+	daemon.mu.Lock()
+	daemon.activeInvocations[invocation.sessionID] = invocation
+	daemon.mu.Unlock()
+
+	var err error
+	var reply DaemonSockResponse
+	reply.ExitCode, reply.Stdout, reply.Stderr, err = CompileCppRemotely(daemon, req.Cwd, invocation, remote)
+
+	daemon.mu.Lock()
+	delete(daemon.activeInvocations, invocation.sessionID)
+	daemon.mu.Unlock()
+
+	if err != nil {
+		// a remote that refused to be this compiler stays refused: the next file hashing here
+		// goes elsewhere, so a mismatched server costs one local compilation, not one per file
+		if status.Code(err) == codes.FailedPrecondition {
+			remote.MarkIncapableOfCxx(invocation.cxxName, status.Convert(err).Message())
 		}
-		invocation.summary.remoteHost = remote.remoteHost
+		return reply, err
+	}
 
-		daemon.mu.Lock()
-		daemon.activeInvocations[invocation.sessionID] = invocation
-		daemon.mu.Unlock()
+	logClient.Info(1, "summary:", invocation.summary.ToLogString(invocation))
+	return reply, nil
+}
 
-		var err error
-		var reply DaemonSockResponse
-		reply.ExitCode, reply.Stdout, reply.Stderr, err = CompileCppRemotely(daemon, req.Cwd, invocation, remote)
+// onRemoteCompilationFailed is the end of the road for a .cpp no server could compile.
+func (daemon *Daemon) onRemoteCompilationFailed(req DaemonSockRequest, invocation *Invocation, reason error) DaemonSockResponse {
+	if !daemon.disableLocalFallback {
+		return daemon.FallbackToLocalCxx(req, reason)
+	}
 
-		daemon.mu.Lock()
-		delete(daemon.activeInvocations, invocation.sessionID)
-		daemon.mu.Unlock()
-
-		if err != nil { // it's not an error in C++ code, it's a network error or remote failure
-			// a remote that refused to be this compiler stays refused: the next file hashing here
-			// goes elsewhere, so a mismatched server costs one local compilation, not one per file
-			if status.Code(err) == codes.FailedPrecondition {
-				remote.MarkIncapableOfCxx(invocation.cxxName, status.Convert(err).Message())
-			}
-			return daemon.FallbackToLocalCxx(req, err)
-		}
-
-		logClient.Info(1, "summary:", invocation.summary.ToLogString(invocation))
-		return reply
+	logClient.Error("remote compilation failed, local fallback disabled:", invocation.cppInFile, reason)
+	return DaemonSockResponse{
+		ExitCode: 1,
+		Stderr:   []byte(fmt.Sprintf("[nocc] could not compile %s remotely (%d retries): %v; not compiling locally, since NOCC_DISABLE_LOCAL_FALLBACK is set\n", invocation.cppInFile, daemon.remoteRetries, reason)),
 	}
 }
 
@@ -338,9 +413,55 @@ func (daemon *Daemon) PeriodicallyInterruptHangedInvocations() {
 	}
 }
 
+func (daemon *Daemon) getRemotes() []*RemoteConnection {
+	daemon.remotesMu.RLock()
+	defer daemon.remotesMu.RUnlock()
+	return daemon.remoteConnections
+}
+
+// reconnectUnavailableRemotes gives every remote marked unavailable another chance.
+// Nothing else ever clears isUnavailable, so without this, a server that restarted (or a network
+// that blipped) mid-build would stay unused for the rest of it. A reconnect builds a whole new
+// RemoteConnection rather than reviving the old one: in-flight state of the old one (its upload
+// queue, its streams) is abandoned along with it.
+// Attempts to one host are throttled, so a pool of retrying invocations doesn't hammer a host that's really down.
+func (daemon *Daemon) reconnectUnavailableRemotes() {
+	const minReconnectInterval = time.Second
+
+	daemon.reconnectMu.Lock()
+	defer daemon.reconnectMu.Unlock()
+
+	remotes := daemon.getRemotes()
+	updated := make([]*RemoteConnection, len(remotes))
+	copy(updated, remotes)
+
+	for index, old := range remotes {
+		if !old.isUnavailable.Load() || time.Since(old.createTime) < minReconnectInterval {
+			continue
+		}
+
+		ctxConnect, cancelFunc := context.WithTimeout(context.Background(), 3*time.Second)
+		remote, err := MakeRemoteConnection(daemon, old.remoteHostPort, ctxConnect)
+		cancelFunc()
+		if err != nil {
+			remote.isUnavailable.Store(true)
+			logClient.Error("reconnect to", old.remoteHostPort, "failed:", err)
+		} else {
+			logClient.Info(0, "reconnected to", old.remoteHostPort)
+		}
+
+		updated[index] = remote
+		old.Clear()
+	}
+
+	daemon.remotesMu.Lock()
+	daemon.remoteConnections = updated
+	daemon.remotesMu.Unlock()
+}
+
 func (daemon *Daemon) areAllRemotesAvailable() bool {
-	for _, remote := range daemon.remoteConnections {
-		if remote.isUnavailable {
+	for _, remote := range daemon.getRemotes() {
+		if remote.isUnavailable.Load() {
 			return false
 		}
 	}
@@ -367,11 +488,12 @@ func (daemon *Daemon) chooseRemoteConnectionForCppCompilation(cppInFile string, 
 	// through Go's % operator, so the index became -1 with two servers configured and
 	// panicked the daemon on the first such file. With a single server it happened to
 	// be masked, since x%1 == 0 for any x.
-	nRemotes := uint32(len(daemon.remoteConnections))
+	remotes := daemon.getRemotes()
+	nRemotes := uint32(len(remotes))
 	startIndex := hasher.Sum32() % nRemotes
 
 	for offset := uint32(0); offset < nRemotes; offset++ {
-		remote := daemon.remoteConnections[(startIndex+offset)%nRemotes]
+		remote := remotes[(startIndex+offset)%nRemotes]
 		if remote.CanCompileWithCxx(cxxName) {
 			return remote
 		}
