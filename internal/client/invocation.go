@@ -23,8 +23,9 @@ type Invocation struct {
 	invokeType int   // one of the constants above
 	err        error // any error occurred while parsing/uploading/compiling/receiving
 
-	createTime time.Time // used for local timeout
-	sessionID  uint32    // incremental while a daemon is alive
+	createTime time.Time         // used for local timeout
+	sessionID  uint32            // incremental while a daemon is alive
+	remote     *RemoteConnection // where it's being compiled, so a remote going down interrupts it
 
 	// cmdLine is parsed to the following fields:
 	cppInFile  string      // input file as specified in cmd line (.cpp for compilation, .h for pch generation)
@@ -256,8 +257,18 @@ func (invocation *Invocation) DoneUploadFile(err error) {
 	if err != nil {
 		invocation.err = err
 	}
-	atomic.AddInt32(&invocation.waitUploads, -1)
-	invocation.wgUpload.Done() // will end up after all required files uploaded/failed
+	// an upload can complete concurrently with ForceInterrupt draining the counter;
+	// never let the two together release wgUpload more times than it was added
+	for {
+		waitUploads := atomic.LoadInt32(&invocation.waitUploads)
+		if waitUploads <= 0 {
+			return
+		}
+		if atomic.CompareAndSwapInt32(&invocation.waitUploads, waitUploads, waitUploads-1) {
+			invocation.wgUpload.Done() // will end up after all required files uploaded/failed
+			return
+		}
+	}
 }
 
 func (invocation *Invocation) ForceInterrupt(err error) {

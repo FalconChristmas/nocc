@@ -93,7 +93,7 @@ func TestOtherFilesKeepTheirServer(t *testing.T) {
 func TestUnavailableServersAreSkippedToo(t *testing.T) {
 	conns := newTestRemotes(2)
 	daemon := &Daemon{remoteConnections: conns}
-	conns[0].isUnavailable = true
+	conns[0].isUnavailable.Store(true)
 
 	for i := 0; i < 500; i++ {
 		if remote := daemon.chooseRemoteConnectionForCppCompilation(fmt.Sprintf("file%d.cpp", i), "g++"); remote != conns[1] {
@@ -107,7 +107,7 @@ func TestUnavailableServersAreSkippedToo(t *testing.T) {
 func TestNoUsableServerReturnsNil(t *testing.T) {
 	conns := newTestRemotes(2)
 	daemon := &Daemon{remoteConnections: conns}
-	conns[0].isUnavailable = true
+	conns[0].isUnavailable.Store(true)
 	conns[1].MarkIncapableOfCxx("g++", "not installed there")
 
 	if remote := daemon.chooseRemoteConnectionForCppCompilation("1.cpp", "g++"); remote != nil {

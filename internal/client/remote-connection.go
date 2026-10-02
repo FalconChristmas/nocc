@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/VKCOM/nocc/internal/common"
 	"github.com/VKCOM/nocc/pb"
@@ -14,11 +16,13 @@ import (
 // It also has methods that call grpc, so this module is close to protobuf.
 // Daemon makes one RemoteConnection to one server — for server.Session creation, files uploading, obj receiving.
 // If a remote is not available on daemon start (on becomes unavailable in the middle),
-// then all invocations that should be sent to that remote are executed locally within a daemon.
+// then all invocations that should be sent to that remote go to another one, or are executed locally within a daemon.
+// An unavailable remote is never revived in place: a retry replaces it with a fresh connection, see reconnectUnavailableRemotes.
 type RemoteConnection struct {
 	remoteHostPort string
 	remoteHost     string // for console output and logs, just IP is more pretty
-	isUnavailable  bool
+	isUnavailable  atomic.Bool
+	createTime     time.Time // when this connection was attempted; throttles reconnects
 
 	// compilers this remote has refused to be (a missing toolchain, or a name that resolves to
 	// a different target there). Set once, then this remote is skipped for that compiler:
@@ -48,6 +52,7 @@ func MakeRemoteConnection(daemon *Daemon, remoteHostPort string, ctxWithTimeout 
 	remote := &RemoteConnection{
 		remoteHostPort:  remoteHostPort,
 		remoteHost:      ExtractRemoteHostWithoutPort(remoteHostPort),
+		createTime:      time.Now(),
 		grpcClient:      grpcClient,
 		filesUploading:  MakeFilesUploading(daemon, grpcClient),
 		filesReceiving:  MakeFilesReceiving(daemon, grpcClient),
@@ -91,7 +96,7 @@ func (remote *RemoteConnection) MarkIncapableOfCxx(cxxName string, reason string
 
 // CanCompileWithCxx reports whether it's worth sending a cxxName compilation here.
 func (remote *RemoteConnection) CanCompileWithCxx(cxxName string) bool {
-	if remote.isUnavailable {
+	if remote.isUnavailable.Load() {
 		return false
 	}
 	_, isIncapable := remote.incapableCxxNames.Load(cxxName)
@@ -103,7 +108,7 @@ func (remote *RemoteConnection) CanCompileWithCxx(cxxName string) bool {
 // As an input, we send metadata about all dependencies needed for a .cpp to be compiled (.h/.nocc-pch/etc.).
 // As an output, the remote responds with files that are missing and needed to be uploaded.
 func (remote *RemoteConnection) StartCompilationSession(invocation *Invocation, cwd string, requiredFiles []*pb.FileMetadata) ([]uint32, error) {
-	if remote.isUnavailable {
+	if remote.isUnavailable.Load() {
 		return nil, fmt.Errorf("remote %s is unavailable", remote.remoteHost)
 	}
 
@@ -129,6 +134,11 @@ func (remote *RemoteConnection) StartCompilationSession(invocation *Invocation, 
 
 // UploadFilesToRemote uploads files to the remote in parallel and finishes after all of them are done.
 func (remote *RemoteConnection) UploadFilesToRemote(invocation *Invocation, requiredFiles []*pb.FileMetadata, fileIndexesToUpload []uint32) error {
+	// nobody may be reading the upload queue of a dead remote; don't wait on it
+	if remote.isUnavailable.Load() {
+		return fmt.Errorf("remote %s is unavailable", remote.remoteHost)
+	}
+
 	invocation.waitUploads = int32(len(fileIndexesToUpload))
 	invocation.wgUpload.Add(int(invocation.waitUploads))
 
@@ -152,7 +162,7 @@ func (remote *RemoteConnection) WaitForCompiledObj(invocation *Invocation) (exit
 }
 
 func (remote *RemoteConnection) SendStopClient(ctxSmallTimeout context.Context) {
-	if remote.isUnavailable {
+	if remote.isUnavailable.Load() {
 		return
 	}
 	_, _ = remote.grpcClient.pb.StopClient(
