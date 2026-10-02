@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -107,7 +106,7 @@ func (s *NoccServer) StartClient(_ context.Context, in *pb.StartClientRequest) (
 func (s *NoccServer) StartCompilationSession(_ context.Context, in *pb.StartCompilationSessionRequest) (*pb.StartCompilationSessionReply, error) {
 	client := s.ActiveClients.GetClient(in.ClientID)
 	if client == nil {
-		atomic.AddInt64(&s.Stats.clientsUnauthenticated, 1)
+		s.Stats.clientsUnauthenticated.Add(1)
 		logServer.Error("unauthenticated client on session start", "clientID", in.ClientID)
 		return nil, status.Errorf(codes.Unauthenticated, "clientID %s not found; probably, the server was restarted just now", in.ClientID)
 	}
@@ -115,18 +114,18 @@ func (s *NoccServer) StartCompilationSession(_ context.Context, in *pb.StartComp
 	// refuse before anything is uploaded if this server can't be the compiler the client asked for:
 	// the client then falls back (locally, or to another server) instead of receiving wrong objects
 	if err := s.CxxCapability.CheckCompilerMatchesClient(in.CxxName, in.CxxTargetTriplet); err != nil {
-		atomic.AddInt64(&s.Stats.sessionsFailedOpen, 1)
+		s.Stats.sessionsFailedOpen.Add(1)
 		logServer.Error("refused session", "clientID", in.ClientID, "sessionID", in.SessionID, err)
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
 
 	session, err := client.CreateNewSession(in)
 	if err != nil {
-		atomic.AddInt64(&s.Stats.sessionsFailedOpen, 1)
+		s.Stats.sessionsFailedOpen.Add(1)
 		logServer.Error("failed to open session", "clientID", in.ClientID, "sessionID", in.SessionID, err)
 		return nil, err
 	}
-	atomic.AddInt64(&s.Stats.sessionsCount, 1)
+	s.Stats.sessionsCount.Add(1)
 
 	// optimistic path: this .o has already been compiled earlier and exists in obj cache
 	// then we don't need to upload files from the client (and even don't need to link them from src cache)
@@ -141,7 +140,7 @@ func (s *NoccServer) StartCompilationSession(_ context.Context, in *pb.StartComp
 
 			logServer.Info(0, "started", "sessionID", session.sessionID, "clientID", client.clientID, "from obj cache", in.CppInFile)
 			client.RegisterCreatedSession(session)
-			atomic.AddInt64(&s.Stats.sessionsFromObjCache, 1)
+			s.Stats.sessionsFromObjCache.Add(1)
 			session.PushToClientReadyChannel()
 
 			return &pb.StartCompilationSessionReply{}, nil
@@ -234,7 +233,7 @@ func (s *NoccServer) UploadFileStream(stream pb.CompilationService_UploadFileStr
 
 		client := s.ActiveClients.GetClient(firstChunk.ClientID)
 		if client == nil {
-			atomic.AddInt64(&s.Stats.clientsUnauthenticated, 1)
+			s.Stats.clientsUnauthenticated.Add(1)
 			logServer.Error("unauthenticated client on upload stream", "clientID", firstChunk.ClientID)
 			return status.Errorf(codes.Unauthenticated, "client %s not found", firstChunk.ClientID)
 		}
@@ -280,8 +279,8 @@ func (s *NoccServer) UploadFileStream(stream pb.CompilationService_UploadFileStr
 		_ = stream.Send(&pb.UploadFileReply{})
 		_ = s.SrcFileCache.SaveFileToCache(file.serverFileName, path.Base(file.serverFileName), file.fileSHA256, file.fileSize)
 
-		atomic.AddInt64(&s.Stats.bytesReceived, file.fileSize)
-		atomic.AddInt64(&s.Stats.filesReceived, 1)
+		s.Stats.bytesReceived.Add(file.fileSize)
+		s.Stats.filesReceived.Add(1)
 		// start waiting for the next file over the same stream
 	}
 }
@@ -294,7 +293,7 @@ func (s *NoccServer) UploadFileStream(stream pb.CompilationService_UploadFileStr
 func (s *NoccServer) RecvCompiledObjStream(in *pb.OpenReceiveStreamRequest, stream pb.CompilationService_RecvCompiledObjStreamServer) error {
 	client := s.ActiveClients.GetClient(in.ClientID)
 	if client == nil {
-		atomic.AddInt64(&s.Stats.clientsUnauthenticated, 1)
+		s.Stats.clientsUnauthenticated.Add(1)
 		logServer.Error("unauthenticated client on recv stream", "clientID", in.ClientID)
 		return status.Errorf(codes.Unauthenticated, "client %s not found", in.ClientID)
 	}
@@ -345,8 +344,8 @@ func (s *NoccServer) RecvCompiledObjStream(in *pb.OpenReceiveStreamRequest, stre
 				if err != nil {
 					return onError(session.sessionID, "can't send obj file %s sessionID %d clientID %s %v", session.objOutFile, session.sessionID, client.clientID, err)
 				}
-				atomic.AddInt64(&s.Stats.filesSent, 1)
-				atomic.AddInt64(&s.Stats.bytesSent, bytesSent)
+				s.Stats.filesSent.Add(1)
+				s.Stats.bytesSent.Add(bytesSent)
 			}
 
 			client.CloseSession(session)
@@ -401,7 +400,7 @@ func (s *NoccServer) Status(context.Context, *pb.StatusRequest) (*pb.StatusReply
 		ObjCacheSize:    s.ObjFileCache.GetBytesOnDisk(),
 		ULimit:          int64(rLimit.Cur),
 		UName:           strings.TrimSpace(string(uNameRV)),
-		SessionsTotal:   atomic.LoadInt64(&s.Stats.sessionsCount),
+		SessionsTotal:   s.Stats.sessionsCount.Load(),
 		SessionsActive:  s.ActiveClients.ActiveSessionsCount(),
 		CxxCalls:        s.CxxLauncher.GetTotalCxxCallsCount(),
 		CxxDurMore10Sec: s.CxxLauncher.GetMore10secCount(),
