@@ -43,9 +43,17 @@ func (fr *FilesReceiving) CreateReceiveStream() error {
 	return nil
 }
 
-func (fr *FilesReceiving) RecreateReceiveStreamOrQuit(failedStreamCancelFunc context.CancelFunc, err error) {
+// RecreateReceiveStreamOrQuit replaces a broken stream.
+// Unless the server ended the stream itself (objsMayBeLost is false then), .o files it had already pushed
+// into it are lost: a server's Send only queues into the transport, so the server takes them as delivered
+// and will never send them again. Nothing tells which invocations those were, so all of them on this remote
+// fail now and get retried, rather than wait for forceInterruptTimeout.
+func (fr *FilesReceiving) RecreateReceiveStreamOrQuit(failedStreamCancelFunc context.CancelFunc, err error, objsMayBeLost bool) {
 	failedStreamCancelFunc() // will close the stream on the server also
 	logClient.Error("recreate recv stream:", err)
+	if objsMayBeLost {
+		fr.daemon.OnRecvStreamBroke(fr.grpcClient, err)
+	}
 	time.Sleep(100 * time.Millisecond)
 
 	if err := fr.CreateReceiveStream(); err != nil {
@@ -87,8 +95,9 @@ func (fr *FilesReceiving) monitorRemoteStreamForObjReceiving(stream pb.Compilati
 
 			// if something weird occurs, the server fails to send a chunk to a stream
 			// it closes the stream and includes metadata to trailer
-			// here, on the client size, we mark this invocation as errored, they'll be compiled locally
-			// this prevents invocations from hanging — at least when a network works as expected
+			// here, on the client size, we mark this invocation as errored, they'll be retried
+			// a trailer arrives only with the server's own end of the stream, after everything it sent before,
+			// so this session is the only one lost
 			mdSession := stream.Trailer().Get("sessionID")
 			if len(mdSession) == 1 {
 				sessionID, _ := strconv.Atoi(mdSession[0])
@@ -96,12 +105,14 @@ func (fr *FilesReceiving) monitorRemoteStreamForObjReceiving(stream pb.Compilati
 				if invocation != nil {
 					invocation.DoneRecvObj(err)
 				}
+				fr.RecreateReceiveStreamOrQuit(cancelFunc, err, false)
+				return
 			}
 
-			// NB: there are rpc errors that are not visible to the server-side (like codes.ResourceExhausted)
-			// in this case, the server thinks that .o was sent, but the client gets an error without metadata
-			// such invocations will be cleared later, see PeriodicallyInterruptHangedInvocations()
-			fr.RecreateReceiveStreamOrQuit(cancelFunc, err)
+			// no trailer: the stream broke under the transport (a network blip, a keepalive timeout),
+			// or with an rpc error that is not visible to the server-side (like codes.ResourceExhausted);
+			// the server thinks that whatever .o it pushed was sent
+			fr.RecreateReceiveStreamOrQuit(cancelFunc, err, true)
 			return
 		}
 
@@ -110,7 +121,7 @@ func (fr *FilesReceiving) monitorRemoteStreamForObjReceiving(stream pb.Compilati
 			logClient.Error("can't find invocation for obj", "sessionID", firstChunk.SessionID)
 			if firstChunk.CxxExitCode == 0 {
 				if err, _ = receiveObjFileByChunks(stream, firstChunk, "/tmp/nocc-dev-null"); err != nil {
-					fr.RecreateReceiveStreamOrQuit(cancelFunc, err)
+					fr.RecreateReceiveStreamOrQuit(cancelFunc, err, true)
 					return
 				}
 			}
@@ -142,7 +153,7 @@ func (fr *FilesReceiving) monitorRemoteStreamForObjReceiving(stream pb.Compilati
 		// recreate a stream if it's corrupted, like chunks mismatch
 		// (if so, invocation won't be left hanged, as it's already errored)
 		if err != nil && needRecreateStream {
-			fr.RecreateReceiveStreamOrQuit(cancelFunc, err)
+			fr.RecreateReceiveStreamOrQuit(cancelFunc, err, true)
 			return
 		}
 

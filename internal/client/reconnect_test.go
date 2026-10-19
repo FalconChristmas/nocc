@@ -1,13 +1,18 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/VKCOM/nocc/pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 func newTestDaemonWithRemote() (*Daemon, *RemoteConnection) {
@@ -120,5 +125,121 @@ func TestKilledRemoteCompilerIsARemoteFailure(t *testing.T) {
 	invocation.wgRecv.Wait()
 	if invocation.err == nil {
 		t.Fatalf("exit code %d was taken as a compile result, so it would never be retried", invocation.cxxExitCode)
+	}
+}
+
+// brokenRecvStream is a .o stream that has already broken, with the trailer the server managed to send, if any.
+type brokenRecvStream struct {
+	grpc.ClientStream
+	err     error
+	trailer metadata.MD
+}
+
+func (f *brokenRecvStream) Recv() (*pb.RecvCompiledObjChunkReply, error) { return nil, f.err }
+func (f *brokenRecvStream) Trailer() metadata.MD                         { return f.trailer }
+
+// idleRecvStream is a healthy .o stream with nothing to deliver until the daemon quits.
+type idleRecvStream struct {
+	grpc.ClientStream
+	quit chan int
+}
+
+func (f *idleRecvStream) Recv() (*pb.RecvCompiledObjChunkReply, error) {
+	<-f.quit
+	return nil, errors.New("daemon quit")
+}
+
+// reconnectingServer is a server that a broken .o stream is opened to again, successfully.
+type reconnectingServer struct {
+	pb.CompilationServiceClient
+	quit          chan int
+	streamsOpened atomic.Int32
+}
+
+func (f *reconnectingServer) RecvCompiledObjStream(context.Context, *pb.OpenReceiveStreamRequest, ...grpc.CallOption) (pb.CompilationService_RecvCompiledObjStreamClient, error) {
+	f.streamsOpened.Add(1)
+	return &idleRecvStream{quit: f.quit}, nil
+}
+
+// waitingForObj registers an invocation on remote that has finished uploading and waits for its .o.
+func waitingForObj(daemon *Daemon, sessionID uint32, remote *RemoteConnection) *Invocation {
+	invocation := &Invocation{sessionID: sessionID, remote: remote, summary: MakeInvocationSummary()}
+	invocation.wgRecv.Add(1)
+	daemon.activeInvocations[sessionID] = invocation
+	return invocation
+}
+
+func isReleased(invocation *Invocation, within time.Duration) bool {
+	released := make(chan struct{})
+	go func() { invocation.wgRecv.Wait(); close(released) }()
+	select {
+	case <-released:
+		return true
+	case <-time.After(within):
+		return false
+	}
+}
+
+func newDaemonWithReconnectingRemote(t *testing.T) (*Daemon, *RemoteConnection, *reconnectingServer) {
+	daemon, remote := newTestDaemonWithRemote()
+	daemon.quitChan = make(chan int)
+	t.Cleanup(func() { close(daemon.quitChan) })
+	server := &reconnectingServer{quit: daemon.quitChan}
+	remote.grpcClient = &GRPCClient{callContext: context.Background(), pb: server}
+	return daemon, remote, server
+}
+
+// A .o stream that broke under the transport, with no word from the server, may have taken .o files with it:
+// the server pushed them into the stream and takes them as delivered. Every compilation waiting on that server
+// must fail right away (to be retried), even though the stream reconnects fine. Before, they waited for
+// forceInterruptTimeout -- 8 minutes of a build standing still, then a retry.
+func TestBrokenObjStreamFailsTheInvocationsWaitingOnIt(t *testing.T) {
+	daemon, remote, server := newDaemonWithReconnectingRemote(t)
+	other := &RemoteConnection{remoteHost: "host1", grpcClient: &GRPCClient{}}
+	onRemote := waitingForObj(daemon, 1, remote)
+	onOther := waitingForObj(daemon, 2, other)
+
+	broken := &brokenRecvStream{err: status.Error(codes.Unavailable, "transport is closing")}
+	go (&FilesReceiving{daemon: daemon, grpcClient: remote.grpcClient}).monitorRemoteStreamForObjReceiving(broken, func() {})
+
+	if !isReleased(onRemote, time.Second) {
+		t.Fatal("an invocation whose .o may have been lost with the stream is still waiting for it")
+	}
+	if onRemote.err == nil {
+		t.Error("the interrupted invocation has no error, so it would be taken as compiled")
+	}
+	if onOther.err != nil || isReleased(onOther, 0) {
+		t.Error("an invocation on another remote was interrupted too")
+	}
+	if remote.isUnavailable.Load() {
+		t.Error("the remote was marked unavailable, though its stream reconnected")
+	}
+	deadline := time.Now().Add(time.Second)
+	for server.streamsOpened.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if server.streamsOpened.Load() != 1 {
+		t.Errorf("the .o stream was opened again %d times, want 1", server.streamsOpened.Load())
+	}
+	if remote.isUnavailable.Load() {
+		t.Error("the remote was marked unavailable after its stream reconnected")
+	}
+}
+
+// When the server ends the stream itself, the trailer names the one session it failed to send,
+// and arrives after everything sent before it: the other compilations on that server are fine.
+func TestObjStreamEndedByTheServerFailsOnlyItsSession(t *testing.T) {
+	daemon, remote, _ := newDaemonWithReconnectingRemote(t)
+	failed := waitingForObj(daemon, 1, remote)
+	stillCompiling := waitingForObj(daemon, 2, remote)
+
+	broken := &brokenRecvStream{err: status.Error(codes.Unknown, "the C++ compiler was killed"), trailer: metadata.Pairs("sessionID", "1")}
+	go (&FilesReceiving{daemon: daemon, grpcClient: remote.grpcClient}).monitorRemoteStreamForObjReceiving(broken, func() {})
+
+	if !isReleased(failed, time.Second) || failed.err == nil {
+		t.Fatal("the session named in the trailer wasn't failed")
+	}
+	if isReleased(stillCompiling, 300*time.Millisecond) {
+		t.Error("a session the server will still deliver was failed too, so it gets compiled twice")
 	}
 }

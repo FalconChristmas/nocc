@@ -195,7 +195,18 @@ func (daemon *Daemon) OnRemoteBecameUnavailable(grpcClient *GRPCClient, reason e
 	}
 }
 
-// interruptInvocationsOnRemote fails compilations in flight on a remote that went down.
+// OnRecvStreamBroke is called when a stream receiving .o files from grpcClient broke in a way that may have
+// lost some of them (see FilesReceiving.RecreateReceiveStreamOrQuit). The remote stays usable: the stream is
+// recreated, and compilations that fail here are retried.
+func (daemon *Daemon) OnRecvStreamBroke(grpcClient *GRPCClient, reason error) {
+	for _, remote := range daemon.getRemotes() {
+		if remote.grpcClient == grpcClient {
+			daemon.interruptInvocationsOnRemote(remote, fmt.Errorf("the .o stream from %s broke: %v", remote.remoteHost, reason))
+		}
+	}
+}
+
+// interruptInvocationsOnRemote fails compilations in flight on a remote that went down (or lost .o files).
 // Their uploads or .o files will never arrive, and waiting for forceInterruptTimeout
 // before retrying elsewhere (or falling back) would stall the build for minutes.
 func (daemon *Daemon) interruptInvocationsOnRemote(remote *RemoteConnection, reason error) {
