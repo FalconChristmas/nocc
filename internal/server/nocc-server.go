@@ -302,9 +302,8 @@ func (s *NoccServer) RecvCompiledObjStream(in *pb.OpenReceiveStreamRequest, stre
 	// errors occur very rarely (if a client disconnects or something strange happens)
 	// the easiest solution is just to close this stream
 	// if a client is alive, it will open a new stream
-	// if a trailer "sessionID" won't reach a client,
-	// it would still think that a session is in the process of remote compilation
-	// and will clear it after some timeout
+	// if a trailer "sessionID" won't reach a client, it can't tell which session was lost,
+	// so it fails all of its sessions in flight on this server and retries them
 	onError := func(sessionID uint32, format string, a ...interface{}) error {
 		stream.SetTrailer(metadata.Pairs("sessionID", strconv.Itoa(int(sessionID))))
 		err := fmt.Errorf(format, a...)
@@ -312,12 +311,27 @@ func (s *NoccServer) RecvCompiledObjStream(in *pb.OpenReceiveStreamRequest, stre
 		return err
 	}
 
+	// a stream the client has given up on (it cancelled it, or the transport under it died) must leave
+	// ready sessions to the stream the client opens next; a session taken by this one would be lost,
+	// as the client has already stopped reading here
+	streamDone := stream.Context().Done()
+	giveBack := func(session *Session) {
+		go session.PushToClientReadyChannel()
+	}
+
 	for {
 		select {
 		case <-client.chanDisconnected:
 			return nil
 
+		case <-streamDone:
+			return nil
+
 		case session := <-client.chanReadySessions:
+			if stream.Context().Err() != nil { // select picks at random when this stream ended at the same time
+				giveBack(session)
+				return nil
+			}
 			client.lastSeen = time.Now()
 
 			// a compiler killed under this server says nothing about the source: fail the session
@@ -336,12 +350,18 @@ func (s *NoccServer) RecvCompiledObjStream(in *pb.OpenReceiveStreamRequest, stre
 					CxxDuration: session.cxxDuration,
 				})
 				if err != nil {
+					if stream.Context().Err() != nil {
+						giveBack(session)
+					}
 					return onError(session.sessionID, "can't send obj non-0 reply sessionID %d clientID %s %v", session.sessionID, client.clientID, err)
 				}
 			} else {
 				logServer.Info(0, "send obj file", "sessionID", session.sessionID, "clientID", client.clientID, "cxxDuration", session.cxxDuration, session.objOutFile)
 				bytesSent, err := sendObjFileByChunks(stream, chunkBuf, session)
 				if err != nil {
+					if stream.Context().Err() != nil { // the stream died under it: the next one sends it from the start
+						giveBack(session)
+					}
 					return onError(session.sessionID, "can't send obj file %s sessionID %d clientID %s %v", session.objOutFile, session.sessionID, client.clientID, err)
 				}
 				s.Stats.filesSent.Add(1)
