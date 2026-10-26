@@ -24,6 +24,13 @@ type Session struct {
 	cxxName    string // g++ / clang / etc.
 	cxxCmdLine []string
 
+	// set for a coverage compilation (see coverage.go): the client's absolute path of the .o
+	coverageObjFile string
+	// the .gcno it produced, its cwd patched to the client's; nil if the compiler wrote none (-fprofile-arcs alone)
+	coverageNotes []byte
+	// the .gcno couldn't be made right; the session fails, and the client compiles it again elsewhere
+	coverageErr error
+
 	client *Client
 	files  []*fileInClientDir
 
@@ -63,7 +70,12 @@ func (session *Session) PrepareServerCxxCmdLine(noccServer *NoccServer, clientCw
 		session.cxxCwd = session.client.MapClientFileNameToServerAbs(clientCwd)
 	}
 
-	cxxCmdLine := make([]string, 0, len(cxxIDirs)+len(cxxArgs)+3)
+	cxxCmdLine := make([]string, 0, len(cxxIDirs)+len(cxxArgs)+12)
+
+	// first, so that a client's own -ffile-prefix-map (rewritten below) takes precedence: gcc tries the last one first
+	if session.coverageObjFile != "" {
+		cxxCmdLine = append(cxxCmdLine, "-fprofile-prefix-map="+session.client.workingDir+"=")
+	}
 
 	// loop through -I {dir} / -include {file} / etc. (format is guaranteed), converting client {dir} to server path
 	for i := 0; i < len(cxxIDirs); i += 2 {
@@ -76,6 +88,9 @@ func (session *Session) PrepareServerCxxCmdLine(noccServer *NoccServer, clientCw
 		cxxArg := FilePrefixMapOption(cxxArgs[i], session.client.workingDir)
 
 		cxxCmdLine = append(cxxCmdLine, cxxArg)
+	}
+	if session.coverageObjFile != "" {
+		cxxCmdLine = append(cxxCmdLine, coverageCxxArgs(session.coverageObjFile, session.cxxCwd, coverageNotesFileName(session.objOutFile))...)
 	}
 	// build final string
 	session.cxxCmdLine = append(cxxCmdLine, "-o", session.objOutFile, cppInFile)

@@ -22,6 +22,9 @@ func newTestDaemon(cxxName string) *Daemon {
 			// pre-seeded, so parsing a command line in a test never execs the real compiler
 			cxxName: "x86_64-test-linux-gnu",
 		},
+		cxxVersions: map[string]string{
+			cxxName: "14.2.0",
+		},
 	}
 }
 
@@ -120,5 +123,83 @@ func TestDepFileNameIsAbsoluteAndNextToTheObject(t *testing.T) {
 	}
 	if !filepath.IsAbs(invocation.depsFlags.calcOutputDepFileName(invocation)) {
 		t.Error("depfile name is not absolute")
+	}
+}
+
+// A coverage object is only right if the server knows it is one (see server/coverage.go),
+// so every spelling that turns on -fprofile-arcs or -ftest-coverage must be noticed, and an
+// option that puts the coverage files somewhere else must keep the compilation local.
+func TestCoverageOptionsAreNoticed(t *testing.T) {
+	daemon := newTestDaemon("g++")
+
+	for _, c := range []struct {
+		args          []string
+		arcs, notes   bool
+		compileRemote bool
+	}{
+		{nil, false, false, true},
+		{[]string{"--coverage"}, true, true, true},
+		{[]string{"-coverage"}, true, true, true},
+		{[]string{"-fprofile-arcs"}, true, false, true},
+		{[]string{"-ftest-coverage"}, false, true, true},
+		{[]string{"-fprofile-arcs", "-ftest-coverage"}, true, true, true},
+		{[]string{"--coverage", "-fno-test-coverage"}, true, false, true},
+		{[]string{"--coverage", "-fno-profile-arcs", "-fno-test-coverage"}, false, false, true},
+		{[]string{"--coverage", "-fprofile-update=atomic", "-fprofile-abs-path"}, true, true, true},
+		// where the coverage files go is the server's to decide; these would override it
+		{[]string{"--coverage", "-fprofile-dir=/x"}, true, true, false},
+		{[]string{"-fprofile-note=/x.gcno", "--coverage"}, true, true, false},
+		{[]string{"--coverage", "-dumpbase", "x"}, true, true, false},
+		{[]string{"--coverage", "-dumpdir", "x/"}, true, true, false},
+		{[]string{"--coverage", "-save-temps"}, true, true, false},
+		// harmless without coverage
+		{[]string{"-dumpdir", "x/"}, false, false, true},
+		// profile-guided optimization reads and writes profiles the server doesn't have
+		{[]string{"-fprofile-generate"}, false, false, false},
+		{[]string{"-fprofile-use=prof/"}, false, false, false},
+	} {
+		cmdLine := append([]string{"g++", "-c", "1.cpp", "-o", "out/1.o"}, c.args...)
+		invocation := ParseCmdLineInvocation(daemon, "/build/proj", cmdLine)
+		if (invocation.err == nil) != c.compileRemote {
+			t.Errorf("%v: err = %v, want remote compilation %v", c.args, invocation.err, c.compileRemote)
+			continue
+		}
+		if invocation.coverageArcs != c.arcs || invocation.coverageNotes != c.notes {
+			t.Errorf("%v: arcs/notes = %v/%v, want %v/%v", c.args, invocation.coverageArcs, invocation.coverageNotes, c.arcs, c.notes)
+		}
+		if invocation.err == nil && invocation.IsCoverage() && invocation.cxxVersion != "14.2.0" {
+			t.Errorf("%v: cxxVersion %q isn't sent", c.args, invocation.cxxVersion)
+		}
+	}
+
+	// without its version, a server can't verify it's the same compiler, which a coverage object needs
+	daemon.cxxVersions["g++"] = "" // like a compiler that doesn't answer -dumpfullversion
+	invocation := ParseCmdLineInvocation(daemon, "/build/proj", []string{"g++", "--coverage", "-c", "1.cpp", "-o", "1.o"})
+	if invocation.err == nil {
+		t.Errorf("a coverage compilation with an unknown compiler version would be sent to a server")
+	}
+}
+
+// The .gcno goes where gcc would put it: next to the object, named after it, ".o" replaced.
+func TestNotesFileIsNamedAfterTheObject(t *testing.T) {
+	daemon := newTestDaemon("g++")
+
+	for _, c := range []struct {
+		cwd, oFlag string
+		args       []string
+		want       string
+	}{
+		{"/build/proj", "src/foo.o", []string{"--coverage"}, "/build/proj/src/foo.gcno"},
+		{"/build/proj", "CMakeFiles/x.dir/foo.cpp.o", []string{"--coverage"}, "/build/proj/CMakeFiles/x.dir/foo.cpp.gcno"},
+		{"/build/proj", "/abs/out/foo.o", []string{"-ftest-coverage"}, "/abs/out/foo.gcno"},
+		{"/build/proj", "src/foo.o", []string{"-fprofile-arcs"}, ""}, // no .gcno without -ftest-coverage
+	} {
+		invocation := ParseCmdLineInvocation(daemon, c.cwd, append([]string{"g++", "-c", "foo.cpp", "-o", c.oFlag}, c.args...))
+		if invocation.err != nil {
+			t.Fatalf("%v: parse failed: %v", c, invocation.err)
+		}
+		if got := invocation.GetNotesOutFileAbs(); got != c.want {
+			t.Errorf("-o %s %v: notes file %q, want %q", c.oFlag, c.args, got, c.want)
+		}
 	}
 }

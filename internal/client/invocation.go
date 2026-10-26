@@ -41,6 +41,12 @@ type Invocation struct {
 	cxxIDirs   IncludeDirs // -I / -iquote / -isystem go here
 	depsFlags  DepCmdFlags // -MD -MF file and others, used for .d files generation (not passed to server)
 
+	// --coverage = -fprofile-arcs (the object counts into a .gcda, whose path it has compiled in)
+	// + -ftest-coverage (the compiler writes a .gcno next to the .o); see server/coverage.go
+	coverageArcs  bool
+	coverageNotes bool
+	cxxVersion    string // `cxx -dumpfullversion`, sent only for coverage compilations
+
 	waitUploads int32 // files still waiting for upload to finish; 0 releases wgUpload; see Invocation.DoneUploadFile
 	doneRecv    int32 // 1 if o file received or failed receiving; 1 releases wgRecv; see Invocation.DoneRecvObj
 	wgUpload    sync.WaitGroup
@@ -122,12 +128,35 @@ func ParseCmdLineInvocation(daemon *Daemon, cwd string, cmdLine []string) (invoc
 		return ""
 	}
 
+	coverageConflict := "" // an option that would put a coverage compilation's files somewhere the server can't reproduce
+
 	for i := 1; i < len(cmdLine); i++ {
 		arg := cmdLine[i]
 		if len(arg) == 0 {
 			continue
 		}
 		if arg[0] == '-' {
+			// coverage options are passed as is, they only need noticing
+			switch {
+			case arg == "--coverage" || arg == "-coverage":
+				invocation.coverageArcs, invocation.coverageNotes = true, true
+			case arg == "-fprofile-arcs":
+				invocation.coverageArcs = true
+			case arg == "-fno-profile-arcs":
+				invocation.coverageArcs = false
+			case arg == "-ftest-coverage":
+				invocation.coverageNotes = true
+			case arg == "-fno-test-coverage":
+				invocation.coverageNotes = false
+			case strings.HasPrefix(arg, "-fprofile-generate") || strings.HasPrefix(arg, "-fprofile-use") || strings.HasPrefix(arg, "-fauto-profile"):
+				// profile-guided optimization reads or writes profiles at paths a server doesn't have
+				invocation.err = fmt.Errorf("unsupported option: %s", arg)
+				return
+			case strings.HasPrefix(arg, "-fprofile-dir") || strings.HasPrefix(arg, "-fprofile-note") || strings.HasPrefix(arg, "-fprofile-prefix-path") ||
+				strings.HasPrefix(arg, "-dumpbase") || arg == "-dumpdir" || strings.HasPrefix(arg, "-save-temps"):
+				coverageConflict = arg
+			}
+
 			if oFile, ok := parseArgFile("-o", arg, &i); ok {
 				invocation.objOutFile = oFile
 				continue
@@ -211,6 +240,17 @@ func ParseCmdLineInvocation(daemon *Daemon, cwd string, cmdLine []string) (invoc
 		return
 	}
 
+	if invocation.IsCoverage() {
+		if coverageConflict != "" {
+			invocation.err = fmt.Errorf("unsupported option with coverage: %s", coverageConflict)
+			return
+		}
+		if invocation.cxxVersion = daemon.GetCxxVersion(invocation.cxxName); invocation.cxxVersion == "" {
+			invocation.err = fmt.Errorf("can't compile for coverage remotely: unknown version of %s", invocation.cxxName)
+			return
+		}
+	}
+
 	if invocation.cppInFile == "" {
 		invocation.err = fmt.Errorf("unsupported command-line: no input file specified")
 	} else if strings.HasSuffix(invocation.objOutFile, ".o") {
@@ -256,6 +296,29 @@ func (invocation *Invocation) GetCppInFileAbs(cwd string) string {
 // cwd is wherever it happened to be started, which is rarely the caller's build directory.
 func (invocation *Invocation) GetObjOutFileAbs() string {
 	return pathAbs(invocation.cwd, invocation.objOutFile)
+}
+
+// IsCoverage tells whether the object is instrumented for coverage, see server/coverage.go.
+func (invocation *Invocation) IsCoverage() bool {
+	return invocation.coverageArcs || invocation.coverageNotes
+}
+
+// GetNotesOutFileAbs is where the compiler would have written the .gcno: the object's name with ".o"
+// replaced (gcc names it after -o, so "foo.cpp.o" has "foo.cpp.gcno"). "" if there's no .gcno to write.
+func (invocation *Invocation) GetNotesOutFileAbs() string {
+	if !invocation.coverageNotes {
+		return ""
+	}
+	return strings.TrimSuffix(invocation.GetObjOutFileAbs(), ".o") + ".gcno"
+}
+
+// capabilityName is what a remote's refusal is remembered under: a compiler can be fine on a server
+// for everything but coverage.
+func (invocation *Invocation) capabilityName() string {
+	if invocation.IsCoverage() {
+		return coverageCapabilityName(invocation.cxxName)
+	}
+	return invocation.cxxName
 }
 
 func (invocation *Invocation) DoneRecvObj(err error) {

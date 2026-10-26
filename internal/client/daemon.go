@@ -53,6 +53,7 @@ type Daemon struct {
 
 	includesCache     map[string]*IncludesCache // map[cxx_name] => cache (support various cxx compilers during a daemon lifetime)
 	cxxTargetTriplets map[string]string         // map[cxx_name] => `cxx -dumpmachine`, see GetCxxTargetTriplet
+	cxxVersions       map[string]string         // map[cxx_name] => `cxx -dumpfullversion`, see GetCxxVersion
 
 	forceInterruptTimeout time.Duration
 }
@@ -114,6 +115,7 @@ func MakeDaemon(remoteNoccHosts []string, disableObjCache bool, disableOwnInclud
 		activeInvocations:     make(map[uint32]*Invocation, 300),
 		includesCache:         make(map[string]*IncludesCache, 1),
 		cxxTargetTriplets:     make(map[string]string, 1),
+		cxxVersions:           make(map[string]string, 1),
 		forceInterruptTimeout: forceInterruptTimeout,
 	}
 
@@ -282,7 +284,8 @@ func (daemon *Daemon) compileCppRemotelyWithRetries(req DaemonSockRequest, invoc
 		if err == nil {
 			return reply
 		}
-		if attempt >= daemon.remoteRetries {
+		var noCapable *noCapableRemoteError
+		if attempt >= daemon.remoteRetries || errors.As(err, &noCapable) {
 			return daemon.onRemoteCompilationFailed(req, invocation, err)
 		}
 
@@ -296,6 +299,12 @@ func (daemon *Daemon) compileCppRemotelyWithRetries(req DaemonSockRequest, invoc
 	}
 }
 
+// noCapableRemoteError is when every remote is up and has refused to be this compiler: a retry would be
+// refused the same way, so it isn't worth sleeping for.
+type noCapableRemoteError struct{ error }
+
+func (e *noCapableRemoteError) Unwrap() error { return e.error }
+
 // remoteRetryDelay is 1s, 2s, 4s, 8s, then 10s for every next retry — long enough in total for a server
 // to come back from a restart, short enough not to stall a build that only hit a blip.
 func remoteRetryDelay(attempt int) time.Duration {
@@ -308,9 +317,13 @@ func remoteRetryDelay(attempt int) time.Duration {
 // tryCompileCppRemotely is one attempt to compile a .cpp on some server.
 // A non-nil error means a network or server failure, not an error in C++ code (that's a non-zero ExitCode).
 func (daemon *Daemon) tryCompileCppRemotely(req DaemonSockRequest, invocation *Invocation) (DaemonSockResponse, error) {
-	remote := daemon.chooseRemoteConnectionForCppCompilation(invocation.cppInFile, invocation.cxxName)
+	remote := daemon.chooseRemoteConnectionForCppCompilation(invocation.cppInFile, invocation.cxxName, invocation.IsCoverage())
 	if remote == nil {
-		return DaemonSockResponse{}, fmt.Errorf("no remote can compile %s with %s", invocation.cppInFile, invocation.cxxName)
+		err := fmt.Errorf("no remote can compile %s with %s", invocation.cppInFile, invocation.capabilityName())
+		if daemon.areAllRemotesAvailable() { // they all refused it: no retry changes that
+			err = &noCapableRemoteError{err}
+		}
+		return DaemonSockResponse{}, err
 	}
 	invocation.remote = remote
 	invocation.summary.remoteHost = remote.remoteHost
@@ -332,6 +345,10 @@ func (daemon *Daemon) tryCompileCppRemotely(req DaemonSockRequest, invocation *I
 		// goes elsewhere, so a mismatched server costs one local compilation, not one per file
 		if status.Code(err) == codes.FailedPrecondition {
 			remote.MarkIncapableOfCxx(invocation.cxxName, status.Convert(err).Message())
+		}
+		// refused for coverage only (see server/coverage.go): the remote still takes other compilations
+		if status.Code(err) == codes.Unimplemented && invocation.IsCoverage() {
+			remote.MarkIncapableOfCxx(invocation.capabilityName(), status.Convert(err).Message())
 		}
 		return reply, err
 	}
@@ -490,7 +507,7 @@ func (daemon *Daemon) areAllRemotesAvailable() bool {
 // machines nocc exists for, "1/N of the build runs here" is the outcome worth avoiding.
 //
 // Returns nil if no server can serve this compilation at all.
-func (daemon *Daemon) chooseRemoteConnectionForCppCompilation(cppInFile string, cxxName string) *RemoteConnection {
+func (daemon *Daemon) chooseRemoteConnectionForCppCompilation(cppInFile string, cxxName string, coverage bool) *RemoteConnection {
 	hasher := fnv.New32a()
 	_, _ = hasher.Write([]byte(filepath.Base(cppInFile)))
 	// Reduce in uint32, not int. On a 32-bit client (armv7 -- BeagleBone, Pi Zero/1)
@@ -505,7 +522,7 @@ func (daemon *Daemon) chooseRemoteConnectionForCppCompilation(cppInFile string, 
 
 	for offset := uint32(0); offset < nRemotes; offset++ {
 		remote := remotes[(startIndex+offset)%nRemotes]
-		if remote.CanCompileWithCxx(cxxName) {
+		if remote.CanCompileWithCxx(cxxName, coverage) {
 			return remote
 		}
 	}

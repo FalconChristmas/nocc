@@ -99,6 +99,8 @@ func (client *Client) CreateNewSession(in *pb.StartCompilationSessionRequest) (*
 		cxxName:   in.CxxName,
 		cppInFile: in.CppInFile, // as specified in a client cmd line invocation (relative to in.Cwd or abs on a client file system)
 		client:    client,
+
+		coverageObjFile: in.CoverageObjFile,
 		// objOutFile is filled only in cxx is required to be called, see Session.PrepareServerCxxCmdLine()
 	}
 
@@ -134,6 +136,7 @@ func (client *Client) CloseSession(session *Session) {
 		_ = os.Remove(session.objOutFile)
 	}
 	session.files = nil
+	session.coverageNotes = nil
 }
 
 func (client *Client) GetSession(sessionID uint32) *Session {

@@ -95,6 +95,9 @@ func (cxxLauncher *CxxLauncher) GetNonZeroExitCodeCount() int64 {
 func (cxxLauncher *CxxLauncher) launchServerCxxForCpp(session *Session, noccServer *NoccServer) {
 	cxxCommand := exec.Command(session.cxxName, session.cxxCmdLine...)
 	cxxCommand.Dir = session.cxxCwd
+	if session.coverageObjFile != "" {
+		cxxCommand.Env = coverageCxxEnv(session.cxxCwd)
+	}
 	var cxxStdout, cxxStderr bytes.Buffer
 	cxxCommand.Stderr = &cxxStderr
 	cxxCommand.Stdout = &cxxStdout
@@ -104,6 +107,9 @@ func (cxxLauncher *CxxLauncher) launchServerCxxForCpp(session *Session, noccServ
 
 	session.cxxDuration = int32(time.Since(start).Milliseconds())
 	session.cxxExitCode = int32(cxxCommand.ProcessState.ExitCode())
+	if session.coverageObjFile != "" {
+		session.coverageNotes, session.coverageErr = cxxLauncher.takeCoverageNotes(session, session.cxxExitCode == 0)
+	}
 	session.cxxStdout = cxxStdout.Bytes()
 	session.cxxStderr = cxxStderr.Bytes()
 	if len(session.cxxStderr) == 0 && err != nil {
@@ -127,6 +133,20 @@ func (cxxLauncher *CxxLauncher) launchServerCxxForCpp(session *Session, noccServ
 
 	session.cxxStdout = cxxLauncher.patchStdoutDropServerPaths(session.client, session.cxxStdout)
 	session.cxxStderr = cxxLauncher.patchStdoutDropServerPaths(session.client, session.cxxStderr)
+}
+
+// takeCoverageNotes reads (and removes) the .gcno a coverage compilation wrote, and patches its cwd to the client's.
+func (cxxLauncher *CxxLauncher) takeCoverageNotes(session *Session, compiled bool) ([]byte, error) {
+	notesFile := coverageNotesFileName(session.objOutFile)
+	gcno, err := os.ReadFile(notesFile)
+	_ = os.Remove(notesFile)
+	if !compiled || os.IsNotExist(err) { // no -ftest-coverage, only -fprofile-arcs
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return patchGcnoCwd(gcno, session.cxxCwd, session.client.MapServerAbsToClientFileName(session.cxxCwd))
 }
 
 func (cxxLauncher *CxxLauncher) launchServerCxxForPch(cxxName string, cxxCmdLine []string, rootDir string, noccServer *NoccServer) error {

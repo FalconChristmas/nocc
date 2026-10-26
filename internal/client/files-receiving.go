@@ -120,7 +120,7 @@ func (fr *FilesReceiving) monitorRemoteStreamForObjReceiving(stream pb.Compilati
 		if invocation == nil {
 			logClient.Error("can't find invocation for obj", "sessionID", firstChunk.SessionID)
 			if firstChunk.CxxExitCode == 0 {
-				if err, _ = receiveObjFileByChunks(stream, firstChunk, "/tmp/nocc-dev-null"); err != nil {
+				if err, _ = receiveObjFileByChunks(stream, firstChunk, "/tmp/nocc-dev-null", ""); err != nil {
 					fr.RecreateReceiveStreamOrQuit(cancelFunc, err, true)
 					return
 				}
@@ -139,7 +139,7 @@ func (fr *FilesReceiving) monitorRemoteStreamForObjReceiving(stream pb.Compilati
 		invocation.cxxStdout = firstChunk.CxxStdout
 		invocation.cxxStderr = firstChunk.CxxStderr
 		invocation.cxxDuration = firstChunk.CxxDuration
-		invocation.summary.nBytesReceived += int(firstChunk.FileSize)
+		invocation.summary.nBytesReceived += int(firstChunk.FileSize + firstChunk.NotesFileSize)
 
 		// non-zero cxxExitCode means a bug in cpp source code and doesn't require local fallback
 		if firstChunk.CxxExitCode != 0 {
@@ -147,7 +147,12 @@ func (fr *FilesReceiving) monitorRemoteStreamForObjReceiving(stream pb.Compilati
 			continue
 		}
 
-		err, needRecreateStream := receiveObjFileByChunks(stream, firstChunk, invocation.GetObjOutFileAbs())
+		err, needRecreateStream := receiveObjFileByChunks(stream, firstChunk, invocation.GetObjOutFileAbs(), invocation.GetNotesOutFileAbs())
+		// a coverage .o without its .gcno is useless, and would leave a stale .gcno from before next to it
+		if err == nil && invocation.coverageNotes && firstChunk.NotesFileSize == 0 {
+			_ = os.Remove(invocation.GetObjOutFileAbs())
+			err = fmt.Errorf("the remote sent no .gcno for a coverage compilation")
+		}
 		invocation.DoneRecvObj(err)
 
 		// recreate a stream if it's corrupted, like chunks mismatch
@@ -162,24 +167,38 @@ func (fr *FilesReceiving) monitorRemoteStreamForObjReceiving(stream pb.Compilati
 }
 
 // receiveObjFileByChunks is an actual implementation of saving a server stream to a local client .o file.
-// See server.sendObjFileByChunks.
-func receiveObjFileByChunks(stream pb.CompilationService_RecvCompiledObjStreamClient, firstChunk *pb.RecvCompiledObjChunkReply, objOutFile string) (error, bool) {
+// A coverage compilation's .gcno follows the .o in the same chunks (NotesFileSize of them); it's saved to
+// notesOutFile, or dropped if that's "". See server.sendObjFileByChunks.
+func receiveObjFileByChunks(stream pb.CompilationService_RecvCompiledObjStreamClient, firstChunk *pb.RecvCompiledObjChunkReply, objOutFile string, notesOutFile string) (error, bool) {
 	receivedBytes := len(firstChunk.ChunkBody)
-	expectedBytes := int(firstChunk.FileSize)
+	objBytes := int(firstChunk.FileSize)
+	expectedBytes := objBytes + int(firstChunk.NotesFileSize)
 
 	var errWrite error
 	var errRecv error
 
-	if receivedBytes >= expectedBytes {
+	if receivedBytes >= expectedBytes && firstChunk.NotesFileSize == 0 {
 		// if a dir for objOutFile doesn't exist, it will fail; g++/clang act the same
 		errWrite = os.WriteFile(objOutFile, firstChunk.ChunkBody, os.ModePerm)
 		return errWrite, false
 	}
 
+	// the .o goes to a temp file as it arrives; the .gcno, being small, is collected and written after
+	notes := make([]byte, 0, firstChunk.NotesFileSize)
+	objLeft := objBytes
 	fileTmp, errWrite := common.OpenTempFile(objOutFile)
-	if errWrite == nil {
-		_, errWrite = fileTmp.Write(firstChunk.ChunkBody)
+	write := func(body []byte) {
+		n := len(body)
+		if n > objLeft {
+			n = objLeft
+		}
+		if errWrite == nil {
+			_, errWrite = fileTmp.Write(body[:n])
+		}
+		objLeft -= n
+		notes = append(notes, body[n:]...)
 	}
+	write(firstChunk.ChunkBody)
 
 	var nextChunk *pb.RecvCompiledObjChunkReply
 	for receivedBytes < expectedBytes {
@@ -187,19 +206,21 @@ func receiveObjFileByChunks(stream pb.CompilationService_RecvCompiledObjStreamCl
 		if errRecv != nil { // EOF is also unexpected
 			break
 		}
-		if errWrite == nil {
-			_, errWrite = fileTmp.Write(nextChunk.ChunkBody)
-		}
 		if nextChunk.SessionID != firstChunk.SessionID {
 			errRecv = fmt.Errorf("inconsistent stream, chunks mismatch")
 			break
 		}
+		write(nextChunk.ChunkBody)
 		receivedBytes += len(nextChunk.ChunkBody)
 	}
 
+	// the .gcno before the .o: a build that sees the .o takes the compilation as done
+	if errRecv == nil && errWrite == nil && notesOutFile != "" && len(notes) > 0 {
+		errWrite = writeFileAtomically(notesOutFile, notes)
+	}
 	if fileTmp != nil {
 		_ = fileTmp.Close()
-		if errWrite == nil {
+		if errWrite == nil && errRecv == nil {
 			errWrite = os.Rename(fileTmp.Name(), objOutFile)
 		}
 		_ = os.Remove(fileTmp.Name())
@@ -213,6 +234,24 @@ func receiveObjFileByChunks(stream pb.CompilationService_RecvCompiledObjStreamCl
 	default:
 		return nil, false
 	}
+}
+
+func writeFileAtomically(fileName string, body []byte) error {
+	fileTmp, err := common.OpenTempFile(fileName)
+	if err != nil {
+		return err
+	}
+	_, err = fileTmp.Write(body)
+	if errClose := fileTmp.Close(); err == nil {
+		err = errClose
+	}
+	if err == nil {
+		err = os.Rename(fileTmp.Name(), fileName)
+	}
+	if err != nil {
+		_ = os.Remove(fileTmp.Name())
+	}
+	return err
 }
 
 // receiveLogFileByChunks gets a server log file and saves to a client file system, for debugging purposes

@@ -47,6 +47,7 @@ func receiveUploadedFileByChunks(noccServer *NoccServer, stream pb.CompilationSe
 }
 
 // sendObjFileByChunks is an actual implementation of piping a local server file to a client stream.
+// A coverage session's .gcno follows the .o in the same chunks (NotesFileSize says how much of it there is).
 // See client.receiveObjFileByChunks.
 func sendObjFileByChunks(stream pb.CompilationService_RecvCompiledObjStreamServer, chunkBuf []byte, session *Session) (int64, error) {
 	fd, err := os.Open(session.objOutFile)
@@ -58,6 +59,20 @@ func sendObjFileByChunks(stream pb.CompilationService_RecvCompiledObjStreamServe
 	if err != nil {
 		return 0, err
 	}
+	notes := session.coverageNotes
+
+	send := func(body []byte) error {
+		return stream.Send(&pb.RecvCompiledObjChunkReply{
+			SessionID:     session.sessionID,
+			CxxExitCode:   session.cxxExitCode,
+			CxxStdout:     session.cxxStdout,
+			CxxStderr:     session.cxxStderr,
+			CxxDuration:   session.cxxDuration,
+			FileSize:      stat.Size(),
+			NotesFileSize: int64(len(notes)),
+			ChunkBody:     body,
+		})
+	}
 
 	var n int
 	for {
@@ -68,23 +83,24 @@ func sendObjFileByChunks(stream pb.CompilationService_RecvCompiledObjStreamServe
 		if err != nil {
 			return 0, err
 		}
-		err = stream.Send(&pb.RecvCompiledObjChunkReply{
-			SessionID:   session.sessionID,
-			CxxExitCode: session.cxxExitCode,
-			CxxStdout:   session.cxxStdout,
-			CxxStderr:   session.cxxStderr,
-			CxxDuration: session.cxxDuration,
-			FileSize:    stat.Size(),
-			ChunkBody:   chunkBuf[:n],
-		})
-		if err != nil {
+		if err = send(chunkBuf[:n]); err != nil {
 			return 0, err
 		}
+	}
+	for len(notes) > 0 {
+		n = len(notes)
+		if n > len(chunkBuf) {
+			n = len(chunkBuf)
+		}
+		if err = send(notes[:n]); err != nil {
+			return 0, err
+		}
+		notes = notes[n:]
 	}
 
 	// after sending a compiled obj, the client doesn't respond in any way,
 	// so we don't call stream.Recv(), the stream is already ready to send other objs
-	return stat.Size(), nil
+	return stat.Size() + int64(len(session.coverageNotes)), nil
 }
 
 // sendLogFileByChunks streams a local server log file, for debugging purposes

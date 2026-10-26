@@ -267,8 +267,33 @@ Probably, it's used by CMake to track the recompilation tree on that files chang
 `nocc` detects options like `-MD` and emits a depfile on a client-side, after having collected all includes.
 Moreover, these options are stripped off and are not sent to the remote at all.
 
-The following options are supported: `-MF {file}`, `-MT {target}`, `-MQ {target}`, `-MD`.  
-Others (`-M`/`-MMD`/etc.) are unsupported. When they occur, `nocc` falls back to local compilation.
+The following options are supported: `-MF {file}`, `-MT {target}`, `-MQ {target}`, `-MD`, `-MMD`, `-MP`.  
+Others (`-M`/`-MM`/`-MG`) are unsupported. When they occur, `nocc` falls back to local compilation.
+
+
+<p><br></p>
+
+## Coverage builds
+
+With `--coverage` (`-fprofile-arcs`, `-ftest-coverage`), gcc leaves two server paths in its output:
+the `.gcda` path the instrumented program writes its counts to is compiled into the object, formed from the
+absolute `-o` path, and the `.gcno` written next to that `-o` records the compiler's cwd, the server's mirror
+of the client's directory.
+
+So for a coverage compilation the client sends its absolute `.o` path, and the server adds
+`-dumpdir '' -dumpbase {base} -fprofile-dir={client obj dir} -fprofile-prefix-path={its cwd} -fprofile-note={file}`
+and `-fprofile-prefix-map={client dir}=`. The object then names `{client obj dir}/{base}.gcda`, exactly as if
+compiled locally; the server rewrites the cwd in the `.gcno` (no option reaches it) and sends the `.gcno` back
+after the `.o`, and the client saves it where gcc would have: next to the `.o`, `.o` replaced by `.gcno`.
+Coverage objects bypass the server's obj cache, since a `.o` and its `.gcno` must come from one compilation.
+
+This needs gcc 12 or newer, and the same gcc version on the client and the server (a `.gcno`, `.gcda` and libgcov
+of different versions don't work together). A server checks both, the first by compiling a probe the same way
+once per compiler, and refuses a coverage compilation it can't do; the client then sends it to another server,
+or compiles it locally. An older server never gets one: it doesn't announce coverage support on connecting.
+Options that place coverage files themselves (`-fprofile-dir`, `-fprofile-note`, `-dumpbase`, `-dumpdir`,
+`-save-temps`) make a coverage compilation local, and profile-guided optimization (`-fprofile-generate`,
+`-fprofile-use`) is always compiled locally: a server doesn't have the profiles.
 
 
 <p><br></p>

@@ -96,7 +96,7 @@ func (s *NoccServer) StartClient(_ context.Context, in *pb.StartClientRequest) (
 		logServer.Info(0, "new remotes list", strings.Count(in.AllRemotesDelim, ",")+1, "clientID", client.clientID, in.AllRemotesDelim)
 	}
 
-	return &pb.StartClientReply{}, nil
+	return &pb.StartClientReply{SupportsCoverage: true}, nil
 }
 
 // StartCompilationSession is a grpc handler.
@@ -119,6 +119,16 @@ func (s *NoccServer) StartCompilationSession(_ context.Context, in *pb.StartComp
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
 
+	// a compiler that can't make a coverage object the client's way is refused for coverage sessions only:
+	// codes.Unimplemented tells the client to keep sending this server its other compilations
+	if in.CoverageObjFile != "" {
+		if err := s.CxxCapability.CheckCoverageMatchesClient(in.CxxName, in.CxxVersion); err != nil {
+			s.Stats.sessionsFailedOpen.Add(1)
+			logServer.Error("refused coverage session", "clientID", in.ClientID, "sessionID", in.SessionID, err)
+			return nil, status.Errorf(codes.Unimplemented, "%v", err)
+		}
+	}
+
 	session, err := client.CreateNewSession(in)
 	if err != nil {
 		s.Stats.sessionsFailedOpen.Add(1)
@@ -131,7 +141,8 @@ func (s *NoccServer) StartCompilationSession(_ context.Context, in *pb.StartComp
 	// then we don't need to upload files from the client (and even don't need to link them from src cache)
 	// respond that we are waiting 0 files, and the client would immediately request for a compiled obj
 	// it's mostly a moment of optimization: avoid calling os.Link from src cache to working dir
-	if !client.disableObjCache {
+	// (not for coverage: the .o and its .gcno must come from one compilation, and only the .o is cached)
+	if !client.disableObjCache && session.coverageObjFile == "" {
 		session.objCacheKey = s.ObjFileCache.MakeObjCacheKey(in.CxxName, in.CxxArgs, session.files, in.CppInFile)
 		if pathInObjCache := s.ObjFileCache.LookupInCache(session.objCacheKey); len(pathInObjCache) != 0 {
 			session.objCacheExists = true
@@ -339,6 +350,11 @@ func (s *NoccServer) RecvCompiledObjStream(in *pb.OpenReceiveStreamRequest, stre
 			if common.CompilerWasKilled(session.cxxExitCode, session.cxxStderr) {
 				client.CloseSession(session)
 				return onError(session.sessionID, "the C++ compiler was killed on the server for sessionID %d clientID %s: %s", session.sessionID, client.clientID, strings.TrimSpace(string(session.cxxStderr)))
+			}
+
+			if session.coverageErr != nil {
+				client.CloseSession(session)
+				return onError(session.sessionID, "can't make the .gcno for sessionID %d clientID %s: %v", session.sessionID, client.clientID, session.coverageErr)
 			}
 
 			if session.cxxExitCode != 0 {

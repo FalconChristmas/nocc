@@ -53,3 +53,28 @@ func detectCxxTargetTriplet(cxxName string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+// GetCxxVersion is `cxx -dumpfullversion` (cached, like the triplet), or "" if it can't be determined.
+// Only coverage compilations need it: a coverage object works only with the exact compiler version
+// it's linked and reported with here, so the server must be that version too, and it checks.
+func (daemon *Daemon) GetCxxVersion(cxxName string) string {
+	daemon.mu.RLock()
+	version, exists := daemon.cxxVersions[cxxName]
+	daemon.mu.RUnlock()
+	if exists {
+		return version
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, cxxName, "-dumpfullversion").Output()
+	if err != nil {
+		logClient.Info(1, "can't detect the version of", cxxName, err)
+	}
+	version = strings.TrimSpace(string(out))
+
+	daemon.mu.Lock()
+	daemon.cxxVersions[cxxName] = version
+	daemon.mu.Unlock()
+	return version
+}

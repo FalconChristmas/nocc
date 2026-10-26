@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -241,5 +243,64 @@ func TestObjStreamEndedByTheServerFailsOnlyItsSession(t *testing.T) {
 	}
 	if isReleased(stillCompiling, 300*time.Millisecond) {
 		t.Error("a session the server will still deliver was failed too, so it gets compiled twice")
+	}
+}
+
+// The .gcno of a coverage compilation follows the .o on the stream, and chunks don't respect
+// the boundary between them.
+func TestObjAndNotesAreSplitAtFileSize(t *testing.T) {
+	obj, notes := "OBJECT-BYTES", "GCNO-BYTES"
+	all := obj + notes
+	for _, cuts := range [][]int{{len(all)}, {3, 9, 10, 15}, {len(obj)}, {len(obj) + 1}, {1, 2, 3}} {
+		dir := t.TempDir()
+		var chunks []*pb.RecvCompiledObjChunkReply
+		prev := 0
+		for _, cut := range append(cuts, len(all)) {
+			if cut > prev {
+				chunks = append(chunks, &pb.RecvCompiledObjChunkReply{SessionID: 7, FileSize: int64(len(obj)), NotesFileSize: int64(len(notes)), ChunkBody: []byte(all[prev:cut])})
+				prev = cut
+			}
+		}
+		stream := &fakeRecvStream{replies: make(chan *pb.RecvCompiledObjChunkReply, len(chunks))}
+		for _, chunk := range chunks[1:] {
+			stream.replies <- chunk
+		}
+
+		err, _ := receiveObjFileByChunks(stream, chunks[0], dir+"/1.o", dir+"/1.gcno")
+		if err != nil {
+			t.Fatalf("cuts %v: %v", cuts, err)
+		}
+		gotObj, _ := os.ReadFile(dir + "/1.o")
+		gotNotes, _ := os.ReadFile(dir + "/1.gcno")
+		if string(gotObj) != obj || string(gotNotes) != notes {
+			t.Errorf("cuts %v: .o %q .gcno %q", cuts, gotObj, gotNotes)
+		}
+		if leftover, _ := filepath.Glob(dir + "/*.*.*"); len(leftover) != 0 {
+			t.Errorf("cuts %v: temp files left: %v", cuts, leftover)
+		}
+	}
+}
+
+// A server that compiled for coverage but sent no .gcno (one that predates it, behind a client that
+// thought otherwise) fails the compilation, so it's retried, rather than leave a .o whose .gcno is
+// missing or, worse, stale from an earlier build.
+func TestCoverageObjWithoutNotesIsAFailure(t *testing.T) {
+	daemon, _ := newTestDaemonWithRemote()
+	daemon.quitChan = make(chan int)
+	dir := t.TempDir()
+	invocation := &Invocation{sessionID: 5, summary: MakeInvocationSummary(), cwd: dir, objOutFile: "1.o", coverageArcs: true, coverageNotes: true}
+	invocation.wgRecv.Add(1)
+	daemon.activeInvocations[invocation.sessionID] = invocation
+
+	stream := &fakeRecvStream{replies: make(chan *pb.RecvCompiledObjChunkReply, 1)}
+	stream.replies <- &pb.RecvCompiledObjChunkReply{SessionID: 5, FileSize: 3, ChunkBody: []byte("obj")}
+	go (&FilesReceiving{daemon: daemon}).monitorRemoteStreamForObjReceiving(stream, func() {})
+
+	invocation.wgRecv.Wait()
+	if invocation.err == nil {
+		t.Fatalf("a coverage .o without its .gcno was accepted")
+	}
+	if _, err := os.Stat(dir + "/1.o"); err == nil {
+		t.Errorf("the .o was left behind")
 	}
 }

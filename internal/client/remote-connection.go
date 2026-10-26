@@ -27,7 +27,8 @@ type RemoteConnection struct {
 	// compilers this remote has refused to be (a missing toolchain, or a name that resolves to
 	// a different target there). Set once, then this remote is skipped for that compiler:
 	// a build shouldn't rediscover the same mismatch on every file.
-	incapableCxxNames sync.Map // map[cxxName] => reason string
+	incapableCxxNames sync.Map // map[cxxName or "cxxName --coverage"] => reason string
+	supportsCoverage  bool     // the server said so on StartClient; an older one can't, see server/coverage.go
 
 	grpcClient     *GRPCClient
 	filesUploading *FilesUploading
@@ -65,7 +66,7 @@ func MakeRemoteConnection(daemon *Daemon, remoteHostPort string, ctxWithTimeout 
 		return remote, err
 	}
 
-	_, err = grpcClient.pb.StartClient(ctxWithTimeout, &pb.StartClientRequest{
+	startClientReply, err := grpcClient.pb.StartClient(ctxWithTimeout, &pb.StartClientRequest{
 		ClientID:        daemon.clientID,
 		HostUserName:    daemon.hostUserName,
 		ClientVersion:   common.GetVersion(),
@@ -75,6 +76,7 @@ func MakeRemoteConnection(daemon *Daemon, remoteHostPort string, ctxWithTimeout 
 	if err != nil {
 		return remote, err
 	}
+	remote.supportsCoverage = startClientReply.SupportsCoverage
 
 	if err := remote.filesUploading.CreateUploadStream(); err != nil {
 		return remote, err
@@ -95,12 +97,25 @@ func (remote *RemoteConnection) MarkIncapableOfCxx(cxxName string, reason string
 }
 
 // CanCompileWithCxx reports whether it's worth sending a cxxName compilation here.
-func (remote *RemoteConnection) CanCompileWithCxx(cxxName string) bool {
+func (remote *RemoteConnection) CanCompileWithCxx(cxxName string, coverage bool) bool {
 	if remote.isUnavailable.Load() {
 		return false
 	}
-	_, isIncapable := remote.incapableCxxNames.Load(cxxName)
-	return !isIncapable
+	if _, isIncapable := remote.incapableCxxNames.Load(cxxName); isIncapable {
+		return false
+	}
+	if coverage {
+		if !remote.supportsCoverage {
+			return false
+		}
+		_, isIncapable := remote.incapableCxxNames.Load(coverageCapabilityName(cxxName))
+		return !isIncapable
+	}
+	return true
+}
+
+func coverageCapabilityName(cxxName string) string {
+	return cxxName + " --coverage"
 }
 
 // StartCompilationSession starts a session on the remote:
@@ -112,6 +127,10 @@ func (remote *RemoteConnection) StartCompilationSession(invocation *Invocation, 
 		return nil, fmt.Errorf("remote %s is unavailable", remote.remoteHost)
 	}
 
+	coverageObjFile := ""
+	if invocation.IsCoverage() {
+		coverageObjFile = invocation.GetObjOutFileAbs()
+	}
 	startSessionReply, err := remote.grpcClient.pb.StartCompilationSession(
 		remote.grpcClient.callContext,
 		&pb.StartCompilationSessionRequest{
@@ -124,6 +143,8 @@ func (remote *RemoteConnection) StartCompilationSession(invocation *Invocation, 
 			CxxArgs:          invocation.cxxArgs,
 			CxxIDirs:         append(invocation.cxxIDirs.AsCxxArgs(), invocation.includesCache.cxxDefIDirs.AsCxxArgs()...),
 			RequiredFiles:    requiredFiles,
+			CoverageObjFile:  coverageObjFile,
+			CxxVersion:       invocation.cxxVersion,
 		})
 	if err != nil {
 		return nil, err

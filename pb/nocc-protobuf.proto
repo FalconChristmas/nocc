@@ -37,6 +37,9 @@ message StartClientRequest {
 }
 
 message StartClientReply {
+    // the server knows how to compile with --coverage (see server/coverage.go); an older one leaves it false,
+    // and a client then compiles coverage objects elsewhere or locally, never there
+    bool SupportsCoverage = 1;
 }
 
 message StartCompilationSessionRequest {
@@ -52,6 +55,12 @@ message StartCompilationSessionRequest {
     // the server refuses the session unless its own CxxName targets the same triplet: otherwise it would
     // silently return objects of a foreign architecture, which only surfaces much later, at link time
     string CxxTargetTriplet = 15;
+    // set for a --coverage / -fprofile-arcs / -ftest-coverage compilation: the client's absolute path of the .o,
+    // which tells the server where the .gcda goes (it's compiled into the object) and what the .gcno is named
+    string CoverageObjFile = 16;
+    // `cxx -dumpfullversion` on the client; a coverage object only works with the same compiler version on both
+    // sides (the .gcno, .gcda and libgcov must agree), so the server refuses a coverage session without a match
+    string CxxVersion = 17;
 }
 
 message StartCompilationSessionReply {
@@ -82,6 +91,8 @@ message RecvCompiledObjChunkReply {
     int32 CxxDuration = 5;
     int64 FileSize = 6;
     bytes ChunkBody = 7;
+    // the size of the .gcno of a coverage compilation; its bytes follow the FileSize bytes of the .o in the stream
+    int64 NotesFileSize = 8;
 }
 
 message StopClientRequest {
