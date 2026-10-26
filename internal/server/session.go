@@ -70,9 +70,11 @@ func (session *Session) PrepareServerCxxCmdLine(noccServer *NoccServer, clientCw
 		session.cxxCwd = session.client.MapClientFileNameToServerAbs(clientCwd)
 	}
 
-	cxxCmdLine := make([]string, 0, len(cxxIDirs)+len(cxxArgs)+12)
+	cxxCmdLine := make([]string, 0, len(cxxIDirs)+len(cxxArgs)+13)
 
+	// the client's paths in debug info (the compilation dir and the files), not the server's mirror of them;
 	// first, so that a client's own -ffile-prefix-map (rewritten below) takes precedence: gcc tries the last one first
+	cxxCmdLine = append(cxxCmdLine, "-fdebug-prefix-map="+session.client.workingDir+"=")
 	if session.coverageObjFile != "" {
 		cxxCmdLine = append(cxxCmdLine, "-fprofile-prefix-map="+session.client.workingDir+"=")
 	}

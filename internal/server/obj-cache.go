@@ -48,9 +48,15 @@ func MakeObjFileCache(cacheDir string, objTmpDir string, limitBytes int64) (*Obj
 // These are different options, but in fact, they should be considered the same.
 // That's why we don't take include paths into account when calculating a hash from cxxCmdLine.
 // The assumption is: if all deps are equal, their actual paths/names don't matter.
+// objCacheKeyVersion changes whenever the server changes what it compiles into an object for the same
+// client cmd line, so that objects cached before aren't served as if they were the same.
+// 2: -fdebug-prefix-map, the client's paths in debug info instead of the server's.
+const objCacheKeyVersion = "2"
+
 func (cache *ObjFileCache) MakeObjCacheKey(cxxName string, cxxArgs []string, sessionFiles []*fileInClientDir, cppInFile string) common.SHA256 {
 	hasher := sha256.New()
 
+	hasher.Write([]byte(objCacheKeyVersion))
 	hasher.Write([]byte(cxxName))
 	for _, arg := range cxxArgs {
 		hasher.Write([]byte(arg))
